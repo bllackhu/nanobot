@@ -22,7 +22,7 @@ class FeishuConfig(Base):
     react_emoji: str = "THUMBSUP"
     done_emoji: str | None = None
     tool_hint_prefix: str = "\U0001f527"
-    group_policy: Literal["open", "mention"] = "mention"
+    group_policy: Literal["open", "mention", "listen"] = "mention"
     reply_to_message: bool = False
     streaming: bool = True
     domain: Literal["feishu", "lark"] = "feishu"
