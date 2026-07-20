@@ -213,11 +213,21 @@ async def test_dispatch_history_only_image_then_mention_rehydrates_vision(
     captured_messages: list = []
 
     async def fake_process(msg, **kwargs):
+        from nanobot.agent.loop import TurnContext, TurnKind, TurnRoute, TurnState
+
         sess = loop.sessions.get_or_create(msg.session_key)
-        history = sess.get_history(max_messages=500)
-        captured_messages.extend(
-            loop._build_initial_messages(msg, sess, history, None)
+        ctx = TurnContext(
+            msg=msg,
+            session_key=msg.session_key,
+            state=TurnState.BUILD,
+            turn_id="test-turn",
+            runtime=loop.llm_runtime(),
+            kind=TurnKind.USER,
+            route=TurnRoute(channel=msg.channel, chat_id=msg.chat_id),
+            session=sess,
+            history=sess.get_history(max_messages=500),
         )
+        captured_messages.extend(loop._build_initial_messages(ctx))
         return None
 
     loop._process_message = AsyncMock(side_effect=fake_process)  # type: ignore[method-assign]
@@ -284,9 +294,21 @@ async def test_dispatch_five_history_only_images_then_mention_keeps_all_vision(
     captured_messages: list = []
 
     async def fake_process(msg, **kwargs):
+        from nanobot.agent.loop import TurnContext, TurnKind, TurnRoute, TurnState
+
         sess = loop.sessions.get_or_create(msg.session_key)
-        history = sess.get_history(max_messages=500)
-        initial = loop._build_initial_messages(msg, sess, history, None)
+        ctx = TurnContext(
+            msg=msg,
+            session_key=msg.session_key,
+            state=TurnState.BUILD,
+            turn_id="test-turn",
+            runtime=loop.llm_runtime(),
+            kind=TurnKind.USER,
+            route=TurnRoute(channel=msg.channel, chat_id=msg.chat_id),
+            session=sess,
+            history=sess.get_history(max_messages=500),
+        )
+        initial = loop._build_initial_messages(ctx)
         # Mirror OpenAI-compat send path: consecutive multimodal users must
         # survive role alternation with all image_url blocks intact.
         captured_messages.extend(LLMProvider._enforce_role_alternation(initial))
