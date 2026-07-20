@@ -21,6 +21,7 @@ class FeishuConfig(Base):
     allow_from: list[str] = Field(default_factory=list)
     react_emoji: str = "THUMBSUP"
     done_emoji: str | None = None
+    listen_emoji: str = "Pin"  # Ack on listen history-only ingest; set "" to disable
     tool_hint_prefix: str = "\U0001f527"
     group_policy: Literal["open", "mention", "listen"] = "mention"
     reply_to_message: bool = False
