@@ -1,0 +1,101 @@
+"""AgentLoop history-only ingest (no LLM / no outbound)."""
+
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from nanobot.agent.loop import AgentLoop
+from nanobot.bus.events import INBOUND_META_HISTORY_ONLY, InboundMessage
+from nanobot.bus.queue import MessageBus
+from nanobot.providers.base import LLMResponse
+from nanobot.session.webui_turns import WebuiTurnCoordinator
+
+
+def _make_full_loop(tmp_path: Path) -> AgentLoop:
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.generation = SimpleNamespace(max_tokens=4096)
+    provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="should not run"))
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    WebuiTurnCoordinator(
+        bus=loop.bus,
+        sessions=loop.sessions,
+        schedule_background=lambda coro: loop._schedule_background(coro),
+    ).subscribe(loop.runtime_events)
+    return loop
+
+
+@pytest.mark.asyncio
+async def test_dispatch_history_only_persists_without_llm_or_outbound(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    loop._process_message = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    loop.provider.chat_with_retry = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("LLM must not run for history-only ingest"),
+    )
+
+    outbound: list = []
+    original_publish = loop.bus.publish_outbound
+
+    async def capture_outbound(msg):
+        outbound.append(msg)
+        await original_publish(msg)
+
+    loop.bus.publish_outbound = capture_outbound  # type: ignore[method-assign]
+
+    msg = InboundMessage(
+        channel="feishu",
+        sender_id="ou_alice",
+        chat_id="oc_group",
+        content="group chatter",
+        metadata={INBOUND_META_HISTORY_ONLY: True},
+    )
+    await loop._dispatch(msg)
+
+    loop._process_message.assert_not_awaited()
+    loop.provider.chat_with_retry.assert_not_awaited()
+    assert outbound == []
+
+    session = loop.sessions.get_or_create("feishu:oc_group")
+    assert [m["role"] for m in session.messages] == ["user"]
+    assert session.messages[0]["content"] == "group chatter"
+    assert session.metadata.get(AgentLoop._PENDING_USER_TURN_KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_history_only_then_mention_sees_prior_context(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+    await loop._dispatch(
+        InboundMessage(
+            channel="feishu",
+            sender_id="ou_alice",
+            chat_id="oc_group",
+            content="earlier context",
+            metadata={INBOUND_META_HISTORY_ONLY: True},
+        )
+    )
+
+    captured_history: list = []
+
+    async def fake_process(msg, **kwargs):
+        session = loop.sessions.get_or_create(msg.session_key)
+        captured_history.extend(session.messages)
+        return None
+
+    loop._process_message = AsyncMock(side_effect=fake_process)  # type: ignore[method-assign]
+
+    await loop._dispatch(
+        InboundMessage(
+            channel="feishu",
+            sender_id="ou_alice",
+            chat_id="oc_group",
+            content="@bot what was said?",
+        )
+    )
+
+    loop._process_message.assert_awaited_once()
+    assert any(m.get("content") == "earlier context" for m in captured_history)

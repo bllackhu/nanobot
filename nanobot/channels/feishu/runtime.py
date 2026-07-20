@@ -22,7 +22,7 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import INBOUND_META_HISTORY_ONLY, OutboundMessage
 from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
@@ -1211,8 +1211,8 @@ class FeishuChannel(BaseChannel):
         return False
 
     def _is_group_message_for_bot(self, message: Any) -> bool:
-        """Allow group messages when policy is open or bot is @mentioned."""
-        if self.config.group_policy == "open":
+        """Allow group messages when policy is open/listen or bot is @mentioned."""
+        if self.config.group_policy in ("open", "listen"):
             return True
         return self._is_bot_mentioned(message)
 
@@ -2554,6 +2554,12 @@ class FeishuChannel(BaseChannel):
                 self.logger.debug("skipping group message (not mentioned)")
                 return
 
+            history_only = (
+                chat_type == "group"
+                and self.config.group_policy == "listen"
+                and not self._is_bot_mentioned(message)
+            )
+
             # Deduplication check
             if message_id in self._processed_message_ids:
                 return
@@ -2577,13 +2583,15 @@ class FeishuChannel(BaseChannel):
                     )
                 return
 
-            # Add reaction (non-blocking — tracked background task)
-            task = asyncio.create_task(
-                self._add_reaction(message_id, self.config.react_emoji)
-            )
-            self._background_tasks.add(task)
-            task.add_done_callback(self._on_background_task_done)
-            task.add_done_callback(lambda t: self._on_reaction_added(message_id, t))
+            # Add reaction (non-blocking — tracked background task).
+            # Skip for listen-mode history-only ingest (no visible engagement).
+            if not history_only:
+                task = asyncio.create_task(
+                    self._add_reaction(message_id, self.config.react_emoji)
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._on_background_task_done)
+                task.add_done_callback(lambda t: self._on_reaction_added(message_id, t))
 
             # Parse content
             content_parts = []
@@ -2689,19 +2697,22 @@ class FeishuChannel(BaseChannel):
 
             # Forward to message bus
             reply_to = chat_id if chat_type == "group" else sender_id
+            metadata: dict[str, Any] = {
+                "message_id": message_id,
+                "chat_type": chat_type,
+                "msg_type": msg_type,
+                "parent_id": parent_id,
+                "root_id": root_id,
+                "thread_id": thread_id,
+            }
+            if history_only:
+                metadata[INBOUND_META_HISTORY_ONLY] = True
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
                 content=content,
                 media=media_paths,
-                metadata={
-                    "message_id": message_id,
-                    "chat_type": chat_type,
-                    "msg_type": msg_type,
-                    "parent_id": parent_id,
-                    "root_id": root_id,
-                    "thread_id": thread_id,
-                },
+                metadata=metadata,
                 session_key=session_key,
                 is_dm=chat_type == "p2p",
             )
