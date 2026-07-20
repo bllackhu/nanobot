@@ -2584,8 +2584,17 @@ class FeishuChannel(BaseChannel):
                 return
 
             # Add reaction (non-blocking — tracked background task).
-            # Skip for listen-mode history-only ingest (no visible engagement).
-            if not history_only:
+            # Listen history-only: optional persistent listen_emoji ack (no stream
+            # cleanup). Agent turns: temporary react_emoji, removed on stream end.
+            if history_only:
+                listen_emoji = (self.config.listen_emoji or "").strip()
+                if listen_emoji:
+                    task = asyncio.create_task(
+                        self._add_reaction(message_id, listen_emoji)
+                    )
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._on_background_task_done)
+            else:
                 task = asyncio.create_task(
                     self._add_reaction(message_id, self.config.react_emoji)
                 )

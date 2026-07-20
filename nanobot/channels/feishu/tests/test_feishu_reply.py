@@ -26,20 +26,27 @@ from nanobot.channels.feishu.runtime import FeishuChannel, FeishuConfig
 # Helpers
 # ---------------------------------------------------------------------------
 
+_LISTEN_EMOJI_UNSET = object()
+
+
 def _make_feishu_channel(
     reply_to_message: bool = False,
     group_policy: str = "mention",
     topic_isolation: bool = True,
+    listen_emoji: str | object = _LISTEN_EMOJI_UNSET,
 ) -> FeishuChannel:
-    config = FeishuConfig(
-        enabled=True,
-        app_id="cli_test",
-        app_secret="secret",
-        allow_from=["*"],
-        reply_to_message=reply_to_message,
-        group_policy=group_policy,
-        topic_isolation=topic_isolation,
-    )
+    config_kwargs: dict = {
+        "enabled": True,
+        "app_id": "cli_test",
+        "app_secret": "secret",
+        "allow_from": ["*"],
+        "reply_to_message": reply_to_message,
+        "group_policy": group_policy,
+        "topic_isolation": topic_isolation,
+    }
+    if listen_emoji is not _LISTEN_EMOJI_UNSET:
+        config_kwargs["listen_emoji"] = listen_emoji
+    config = FeishuConfig(**config_kwargs)
     channel = FeishuChannel(config, MessageBus())
     channel._client = MagicMock()
     # _loop is only used by the WebSocket thread bridge; not needed for unit tests
@@ -1317,7 +1324,7 @@ async def test_session_key_with_topic_isolation_false_uses_group_scoped() -> Non
 
 
 @pytest.mark.asyncio
-async def test_listen_unmentioned_group_message_sets_history_only_and_skips_reaction() -> None:
+async def test_listen_unmentioned_group_message_sets_history_only_and_adds_default_pin() -> None:
     channel = _make_feishu_channel(group_policy="listen")
     channel._bot_open_id = "ou_bot123"
     bus_spy = []
@@ -1343,7 +1350,70 @@ async def test_listen_unmentioned_group_message_sets_history_only_and_skips_reac
     assert len(bus_spy) == 1
     assert bus_spy[0].metadata.get(INBOUND_META_HISTORY_ONLY) is True
     assert bus_spy[0].content == "side chatter"
+    await asyncio.sleep(0)
+    channel._add_reaction.assert_awaited_once_with("om_listen1", "Pin")
+    assert "om_listen1" not in channel._reaction_ids
+
+
+@pytest.mark.asyncio
+async def test_listen_unmentioned_with_listen_emoji_adds_persistent_ack() -> None:
+    channel = _make_feishu_channel(group_policy="listen", listen_emoji="EYES")
+    channel._bot_open_id = "ou_bot123"
+    bus_spy = []
+    original_publish = channel.bus.publish_inbound
+
+    async def capture(msg):
+        bus_spy.append(msg)
+        await original_publish(msg)
+
+    channel.bus.publish_inbound = capture
+    channel._download_and_save_media = AsyncMock(return_value=(None, ""))
+    channel.transcribe_audio = AsyncMock(return_value="")
+    channel._add_reaction = AsyncMock(return_value=None)
+
+    await channel._on_message(
+        _make_feishu_event(
+            chat_type="group",
+            content='{"text": "side chatter"}',
+            message_id="om_listen_pin",
+        )
+    )
+
+    assert len(bus_spy) == 1
+    assert bus_spy[0].metadata.get(INBOUND_META_HISTORY_ONLY) is True
+    await asyncio.sleep(0)
+    channel._add_reaction.assert_awaited_once_with("om_listen_pin", "EYES")
+    # Persistent ack: must not be registered for stream-end cleanup.
+    assert "om_listen_pin" not in channel._reaction_ids
+
+
+@pytest.mark.asyncio
+async def test_listen_unmentioned_empty_listen_emoji_skips_reaction() -> None:
+    channel = _make_feishu_channel(group_policy="listen", listen_emoji="")
+    channel._bot_open_id = "ou_bot123"
+    channel.bus.publish_inbound = AsyncMock()
+    channel._download_and_save_media = AsyncMock(return_value=(None, ""))
+    channel.transcribe_audio = AsyncMock(return_value="")
+    channel._add_reaction = AsyncMock(return_value=None)
+
+    await channel._on_message(
+        _make_feishu_event(
+            chat_type="group",
+            content='{"text": "side chatter"}',
+            message_id="om_listen_blank",
+        )
+    )
+
     channel._add_reaction.assert_not_awaited()
+
+
+def test_feishu_config_listen_emoji_defaults_pin() -> None:
+    assert FeishuConfig().listen_emoji == "Pin"
+
+
+def test_feishu_config_listen_emoji_accepts_camel_case() -> None:
+    config = FeishuConfig.model_validate({"listenEmoji": "Pin"})
+    assert config.listen_emoji == "Pin"
 
 
 @pytest.mark.asyncio

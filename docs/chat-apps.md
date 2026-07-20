@@ -488,6 +488,7 @@ If QR login is unavailable for your account, use manual setup below.
       "groupPolicy": "mention",
       "reactEmoji": "OnIt",
       "doneEmoji": "DONE",
+      "listenEmoji": "Pin",
       "toolHintPrefix": "🔧",
       "streaming": true,
       "domain": "feishu"
@@ -502,6 +503,7 @@ If QR login is unavailable for your account, use manual setup below.
 > `groupPolicy`: `"mention"` (default — respond only when @mentioned; unmentioned group messages are dropped), `"open"` (respond to all group messages), `"listen"` (save all group messages into session context, but reply only when @mentioned — no LLM/reply for unmentioned messages). Private chats always respond.
 > `reactEmoji`: Emoji for "processing" status (default: `OnIt`). See [available emojis](https://open.larkoffice.com/document/server-docs/im-v1/message-reaction/emojis-introduce).
 > `doneEmoji`: Optional emoji for "completed" status (e.g., `DONE`, `OK`, `HEART`). When set, bot adds this reaction after removing `reactEmoji`.
+> `listenEmoji`: Emoji on **listen** history-only ingest (unmentioned group messages). Default: `"Pin"`. Set `""` to disable (silent). This reaction is persistent (no stream cleanup). Does not affect @mention turns (those still use `reactEmoji` / `doneEmoji`).
 > `toolHintPrefix`: Prefix for inline tool hints in streaming cards (default: `🔧`).
 > `domain`: `"feishu"` (default) for China (open.feishu.cn), `"lark"` for international Lark (open.larksuite.com).
 
