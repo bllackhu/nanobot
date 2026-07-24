@@ -874,6 +874,50 @@ nanobot gateway
 </details>
 
 <details>
+<summary><b>WeCom Chat Archive (会话内容存档)</b></summary>
+
+> Fleet / device-hub mode: **device-hub** receives WeCom `msgaudit_notify`, pulls/decrypts via Finance SDK from the trusted hub IP, and pushes `wecom_archive_batch` to the box. This channel is **inject-only** — no on-box `GetChatData`.
+>
+> Multimodal behaves like Feishu `groupPolicy: listen`: messages stay `_history_only` (no agent turn), but **media is downloaded before persist** so later LLM turns can rehydrate images/files from session history.
+
+**1. Enable**
+
+```bash
+nanobot plugins enable wecom_archive
+```
+
+**2. Configure** (defaults listen on loopback for provisiond)
+
+```json
+{
+  "channels": {
+    "wecom_archive": {
+      "enabled": true,
+      "allowFrom": ["*"],
+      "injectHost": "127.0.0.1",
+      "injectPort": 18791,
+      "injectPath": "/internal/wecom_archive/batch",
+      "downloadMedia": true,
+      "hubBaseUrl": "https://hub.example.com",
+      "deviceId": "",
+      "deviceSecret": ""
+    }
+  }
+}
+```
+
+If `hubBaseUrl` / `deviceId` / `deviceSecret` are empty, the channel falls back to `HUB_BASE_URL` / `CLAWBOT_HUB_BASE_URL`, `CLAWBOT_DEVICE_ID`, `CLAWBOT_DEVICE_SECRET`, or `/etc/clawbot/device-id` + `/etc/clawbot/device-secret` (same identity provisiond uses).
+
+**3. Operator notes**
+
+- Trusted IP = hub egress; callback URL = hub `/api/wecom/v1/archive/callback/{deviceId}`.
+- Hub puller summarizes msgtypes and passes `sdkFileId` for media; **GetMediaData runs on hub** when nanobot calls `POST /api/device/v1/wecom/archive/media`.
+- Files land under `~/.nanobot/media/wecom_archive/`; history keys `dm:…` / `room:…`.
+- Optional voice transcription uses the same `transcribe_audio` path as other channels when available.
+
+</details>
+
+<details>
 <summary><b>Microsoft Teams</b> (MVP — DM only)</summary>
 
 > Direct-message text in/out, tenant-aware OAuth, conversation reference persistence.
