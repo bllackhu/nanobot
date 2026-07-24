@@ -108,6 +108,10 @@ nanobot = "nanobot.cli.commands:app"
 # [project.entry-points."nanobot.tools"]
 # my_plugin = "my_package.plugins:MyTool"
 
+# Third-party agent turn hooks register here.
+# [project.entry-points."nanobot.hooks"]
+# my_hook = "my_package.hooks:create_my_hook"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

@@ -162,6 +162,11 @@ class AgentDefaults(Base):
         serialization_alias="consolidationRatio",
     )  # Consolidation target ratio (0.5 = 50% of budget retained after compression)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+    load_external_hooks: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("loadExternalHooks", "load_external_hooks"),
+        serialization_alias="loadExternalHooks",
+    )  # Discover AgentTurnHookFactory plugins from nanobot.hooks entry points
 
 
 class AgentsConfig(Base):
