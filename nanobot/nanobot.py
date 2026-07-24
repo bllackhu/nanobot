@@ -9,7 +9,9 @@ from typing import Any
 
 from nanobot.agent.hook import AgentHook, SDKCaptureHook
 from nanobot.agent.hooks import create_file_edit_activity_hook
+from nanobot.agent.hook_loader import build_hook_factories
 from nanobot.agent.loop import AgentLoop
+from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config
 from nanobot.providers.image_generation import image_gen_provider_configs
 from nanobot.sdk.clients import MemoryClient, RuntimeClient, SessionClient
@@ -116,10 +118,12 @@ class Nanobot:
         elif model_preset is not None:
             config.agents.defaults.model_preset = model_preset
 
+        bus = MessageBus()
         loop = AgentLoop.from_config(
             config,
+            bus=bus,
             image_generation_provider_configs=image_gen_provider_configs(config),
-            hook_factories=[create_file_edit_activity_hook],
+            hook_factories=build_hook_factories(bus, config, create_file_edit_activity_hook),
         )
         return cls(loop, config=config)
 
