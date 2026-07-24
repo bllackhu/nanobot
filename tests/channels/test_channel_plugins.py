@@ -2371,6 +2371,7 @@ def test_optional_dependency_metadata_for_enable():
         "slack",
         "telegram",
         "wecom",
+        "wecom_archive",
         "weixin",
         "whatsapp",
     }
@@ -2407,6 +2408,7 @@ def test_optional_dependency_metadata_for_enable():
             "python-socks[asyncio]>=2.8.0,<3.0.0; sys_platform != 'win32'",
         ),
         "wecom": ("wecom-aibot-sdk-python>=0.1.5",),
+        "wecom_archive": (),
         "weixin": ("qrcode[pil]>=8.0", "pycryptodome>=3.20.0"),
         "whatsapp": (
             "neonize>=0.3.18.post0,<0.4.0",
