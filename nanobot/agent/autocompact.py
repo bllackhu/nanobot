@@ -17,7 +17,8 @@ if TYPE_CHECKING:
 
 class AutoCompact:
     _RECENT_SUFFIX_MESSAGES = 8
-    _INTERNAL_SESSION_PREFIXES = ("dream:",)
+    # wecom_archive: is HISTORY_ONLY listen context — use cheap file trim, not LLM idle compact.
+    _INTERNAL_SESSION_PREFIXES = ("dream:", "wecom_archive:")
 
     def __init__(self, sessions: SessionManager, consolidator: Consolidator,
                  session_ttl_minutes: int = 0):

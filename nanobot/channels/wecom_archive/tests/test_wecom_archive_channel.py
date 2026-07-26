@@ -27,7 +27,7 @@ async def test_ingest_batch_history_only() -> None:
                     "chatId": "dm:alice:bob",
                     "senderId": "alice",
                     "msgtype": "text",
-                    "content": "[archive] hi",
+                    "content": "[archive] from=alice msgtype=text msgid=m1\nhi",
                     "msgtime": 1,
                 }
             ],
@@ -39,7 +39,9 @@ async def test_ingest_batch_history_only() -> None:
     assert msg.channel == "wecom_archive"
     assert msg.chat_id == "dm:alice:bob"
     assert msg.metadata.get(INBOUND_META_HISTORY_ONLY) is True
-    assert "hi" in msg.content
+    assert msg.content == "hi"
+    assert "[archive]" not in msg.content
+    assert msg.metadata.get("_session_message_extra", {}).get("msgid") == "m1"
     assert msg.media == []
 
 

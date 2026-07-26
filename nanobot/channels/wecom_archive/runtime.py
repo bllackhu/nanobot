@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import uuid
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
@@ -26,6 +27,7 @@ from pydantic import Field
 from nanobot.bus.events import INBOUND_META_HISTORY_ONLY, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.wecom_archive.merge import strip_archive_header
 from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import Base
 from nanobot.utils.helpers import safe_filename
@@ -40,8 +42,10 @@ class WecomArchiveConfig(Base):
 
     enabled: bool = False
     allow_from: list[str] = Field(default_factory=lambda: ["*"])
-    inject_host: str = "127.0.0.1"
-    inject_port: int = 18791
+    # 0.0.0.0 so Docker/Podman host port publish can reach the inject server
+    # (127.0.0.1 inside the container is not reachable via published ports).
+    inject_host: str = "0.0.0.0"
+    inject_port: int = 17790
     inject_path: str = "/internal/wecom_archive/batch"
     inject_token: str = ""
     # Hub GetMediaData proxy (device-authenticated). Empty → env/files.
@@ -49,6 +53,15 @@ class WecomArchiveConfig(Base):
     device_id: str = ""
     device_secret: str = ""
     download_media: bool = True
+    # Context-merge helpers for live wecom group turns (read-time only).
+    bot_user_ids: list[str] = Field(default_factory=list)
+    bot_mention_names: list[str] = Field(default_factory=list)
+    merge_into_wecom: bool = True
+    # Pre-merge archive window (prompt is still bounded by get_history after merge).
+    merge_max_messages: int = Field(default=500, ge=1)
+    merge_max_age_hours: float = Field(default=72.0, ge=0)
+    # Cheap no-LLM disk trim for HISTORY_ONLY archive sessions.
+    archive_file_max_messages: int = Field(default=2000, ge=1)
 
 
 class WecomArchiveChannel(BaseChannel):
@@ -249,6 +262,23 @@ class WecomArchiveChannel(BaseChannel):
         self.logger.debug("wecom_archive saved {} to {}", media_kind, path_str)
         return path_str, f"[{media_kind}: {path_str}]"
 
+    @staticmethod
+    def _msgtime_iso(msgtime: Any) -> str | None:
+        """Convert WeCom msgtime (ms or s) to ISO timestamp for session ordering."""
+        if msgtime is None or isinstance(msgtime, bool):
+            return None
+        try:
+            ts = float(msgtime)
+        except (TypeError, ValueError):
+            return None
+        if ts <= 0:
+            return None
+        if ts > 1e12:
+            ts = ts / 1000.0
+        elif ts > 1e10:
+            ts = ts / 1000.0
+        return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().isoformat()
+
     async def ingest_batch(self, payload: dict[str, Any]) -> int:
         messages = payload.get("messages") or []
         count = 0
@@ -259,7 +289,12 @@ class WecomArchiveChannel(BaseChannel):
             chat_id = str(item.get("chatId") or "")
             if not chat_id:
                 continue
-            content = str(item.get("content") or "")
+            raw_content = str(item.get("content") or "")
+            content, header_meta = strip_archive_header(raw_content)
+            msgid = item.get("msgid") or item.get("msgId") or header_meta.get("msgid")
+            msgtype = item.get("msgtype") or header_meta.get("msgtype")
+            if header_meta.get("from") and sender_id in ("", "unknown"):
+                sender_id = str(header_meta["from"])
             media = item.get("media") or []
             if not isinstance(media, list):
                 media = []
@@ -272,21 +307,33 @@ class WecomArchiveChannel(BaseChannel):
                 if media_kind == "voice":
                     transcription = await self.transcribe_audio(path_str)
                     if transcription:
-                        content = f"{content}\n[transcription: {transcription}]"
+                        content = f"{content}\n[transcription: {transcription}]".strip()
                     elif media_label:
-                        content = f"{content}\n{media_label}"
+                        content = f"{content}\n{media_label}".strip()
                 elif media_label and media_label not in content:
-                    content = f"{content}\n{media_label}"
+                    content = f"{content}\n{media_label}".strip()
+
+            session_extra: dict[str, Any] = {
+                "msgid": msgid,
+                "from": sender_id,
+                "msgtype": msgtype,
+            }
+            ts_iso = self._msgtime_iso(item.get("msgtime"))
+            if ts_iso:
+                session_extra["timestamp"] = ts_iso
+            # Drop empty structured fields so we do not pollute jsonl with nulls.
+            session_extra = {k: v for k, v in session_extra.items() if v is not None and v != ""}
 
             meta = {
                 INBOUND_META_HISTORY_ONLY: True,
-                "msgid": item.get("msgid") or item.get("msgId"),
-                "msgtype": item.get("msgtype"),
+                "msgid": msgid,
+                "msgtype": msgtype,
                 "msgtime": item.get("msgtime"),
                 "corpId": payload.get("corpId"),
                 "seq": item.get("seq"),
                 "sdkFileId": item.get("sdkFileId") or item.get("sdk_file_id"),
                 "mediaKind": item.get("mediaKind"),
+                "_session_message_extra": session_extra,
             }
             await self._handle_message(
                 sender_id=sender_id,

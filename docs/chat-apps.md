@@ -894,8 +894,8 @@ nanobot plugins enable wecom_archive
     "wecom_archive": {
       "enabled": true,
       "allowFrom": ["*"],
-      "injectHost": "127.0.0.1",
-      "injectPort": 18791,
+      "injectHost": "0.0.0.0",
+      "injectPort": 17790,
       "injectPath": "/internal/wecom_archive/batch",
       "downloadMedia": true,
       "hubBaseUrl": "https://hub.example.com",
@@ -914,6 +914,36 @@ If `hubBaseUrl` / `deviceId` / `deviceSecret` are empty, the channel falls back 
 - Hub puller summarizes msgtypes and passes `sdkFileId` for media; **GetMediaData runs on hub** when nanobot calls `POST /api/device/v1/wecom/archive/media`.
 - Files land under `~/.nanobot/media/wecom_archive/`; history keys `dm:…` / `room:…`.
 - Optional voice transcription uses the same `transcribe_audio` path as other channels when available.
+
+**4. Session layout and live wecom context merge**
+
+- Archive group traffic is stored under `wecom_archive:room:<ROOMID>` (HISTORY_ONLY; no agent turn).
+- Live bot group traffic stays under `wecom:<ROOMID>`.
+- On a **wecom group** agent turn, nanobot merges sibling archive room history into the LLM context (time-sorted). `@mention` twins are deduped by normalized text + a ~2 minute window (live row kept).
+- Persist shape: `content` is the message body only; `msgid` / `from` / `msgtype` are structured fields on wecom_archive rows (not embedded in content, not added to other channels).
+- DMs are not merged (`wecom_archive:dm:…` stays archive-only).
+
+**Consolidation / size bounds**
+
+- Live `wecom:` sessions use the normal soft token consolidation + idle AutoCompact path.
+- Archive sessions do **not** run LLM consolidation (HISTORY_ONLY listen context). Instead:
+  - Pre-merge window: last `mergeMaxMessages` (default 500) and/or `mergeMaxAgeHours` (default 72).
+  - Post-merge prompt still uses shared `get_history` message/token budgets.
+  - Cheap disk trim when archive jsonl exceeds `archiveFileMaxMessages` (default 2000); no write into `memory/history.jsonl`.
+  - Idle AutoCompact skips `wecom_archive:` keys.
+
+Optional merge tuning on `wecom_archive`:
+
+```json
+{
+  "botUserIds": ["BotServiceAccount"],
+  "botMentionNames": ["客服小壹"],
+  "mergeIntoWecom": true,
+  "mergeMaxMessages": 500,
+  "mergeMaxAgeHours": 72,
+  "archiveFileMaxMessages": 2000
+}
+```
 
 </details>
 

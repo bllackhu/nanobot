@@ -306,6 +306,22 @@ class TestCheckExpired:
         scheduler.assert_not_called()
         assert "dream:20260602-155256" not in ac._archiving
 
+    def test_wecom_archive_session_skips(self):
+        """HISTORY_ONLY wecom_archive sessions should not use LLM idle compact."""
+        ac = _make_autocompact(ttl=15)
+        mock_sm = MagicMock(spec=SessionManager)
+        old_ts = (datetime.now() - timedelta(minutes=20)).isoformat()
+        mock_sm.list_sessions.return_value = [
+            {"key": "wecom_archive:room:wrROOM", "updated_at": old_ts},
+        ]
+        ac.sessions = mock_sm
+        scheduler = MagicMock()
+
+        ac.check_expired(scheduler, _runtime)
+
+        scheduler.assert_not_called()
+        assert "wecom_archive:room:wrROOM" not in ac._archiving
+
     def test_already_trimmed_session_skips(self):
         """Expired session with no removable tail should not be re-scheduled."""
         ac = _make_autocompact(ttl=15)

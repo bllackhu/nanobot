@@ -630,6 +630,8 @@ class AgentLoop:
         msg: InboundMessage,
         session: Session,
         runtime_context_blocks: list[RuntimeContextBlock] | None = None,
+        *,
+        mark_pending: bool = True,
         **kwargs: Any,
     ) -> bool:
         """Persist the triggering user message before the turn starts.
@@ -655,7 +657,8 @@ class AgentLoop:
             if runtime_context_meta is not None:
                 extra[RUNTIME_CONTEXT_HISTORY_META] = runtime_context_meta
             session.add_message("user", text, **extra)
-            self._mark_pending_user_turn(session)
+            if mark_pending:
+                self._mark_pending_user_turn(session)
             self.sessions.save(session)
             return True
         return False
@@ -1088,11 +1091,172 @@ class AgentLoop:
         without any LLM call or outbound reply.
         """
         session = self.sessions.get_or_create(session_key)
-        self._persist_user_message_early(msg, session)
-        # History-only ingest is not an agent turn — do not leave the
-        # pending-user-turn marker that early persist sets for real turns.
-        self._clear_pending_user_turn(session)
-        self.sessions.save(session)
+        # Never mark pending_user_turn for history-only ingest — that flag is
+        # for real agent turns and briefly flickered on archive sessions when
+        # mark+clear raced with an intermediate save.
+        self._persist_user_message_early(msg, session, mark_pending=False)
+        if session_key.startswith("wecom_archive:"):
+            self._maybe_trim_wecom_archive_session(session)
+
+    def _wecom_archive_channel_config(self) -> Mapping[str, Any] | None:
+        """Return raw wecom_archive channel config dict when present."""
+        channels = self.channels_config
+        if channels is None:
+            return None
+        raw = getattr(channels, "wecom_archive", None)
+        if raw is None:
+            extra = getattr(channels, "model_extra", None) or {}
+            if isinstance(extra, Mapping):
+                raw = extra.get("wecom_archive")
+        if isinstance(raw, Mapping):
+            return raw
+        if raw is not None and hasattr(raw, "model_dump"):
+            try:
+                dumped = raw.model_dump(by_alias=True)
+            except Exception:
+                return None
+            return dumped if isinstance(dumped, dict) else None
+        return None
+
+    def _load_session_if_exists(self, key: str) -> Session | None:
+        """Load a session without creating an empty file for missing keys."""
+        cached = self.sessions._cached(key)
+        if cached is not None:
+            return cached
+        return self.sessions._load(key)
+
+    def _maybe_trim_wecom_archive_session(self, session: Session) -> None:
+        """Cheap no-LLM trim when wecom_archive jsonl exceeds the file cap."""
+        if not session.key.startswith("wecom_archive:"):
+            return
+        from nanobot.session.manager import FILE_MAX_MESSAGES
+
+        cfg = self._wecom_archive_channel_config() or {}
+        limit = cfg.get("archiveFileMaxMessages", cfg.get("archive_file_max_messages"))
+        if not isinstance(limit, int) or limit <= 0:
+            limit = FILE_MAX_MESSAGES
+        before = len(session.messages)
+        # No on_archive callback — do not dump room chatter into history.jsonl.
+        session.enforce_file_cap(on_archive=None, limit=limit)
+        if len(session.messages) < before:
+            self.sessions.save(session)
+            logger.debug(
+                "wecom_archive disk trim key={} before={} after={} limit={}",
+                session.key,
+                before,
+                len(session.messages),
+                limit,
+            )
+
+    def _history_for_turn(self, ctx: TurnContext, **hist_kwargs: Any) -> list[dict[str, Any]]:
+        """Build LLM history, merging wecom_archive room context for wecom groups."""
+        from nanobot.channels.wecom_archive.merge import (
+            archive_room_session_key,
+            merge_wecom_group_history,
+            should_merge_wecom_archive,
+            window_archive_messages,
+        )
+
+        meta = ctx.msg.metadata if isinstance(ctx.msg.metadata, Mapping) else {}
+        chat_type = str(meta.get("chat_type") or meta.get("chattype") or "")
+        live_key = ctx.session.key
+        archive_key = archive_room_session_key(ctx.msg.chat_id) if ctx.msg.chat_id else ""
+
+        def _merge_skip(reason: str) -> list[dict[str, Any]]:
+            logger.debug(
+                "wecom_archive merge skip reason={} channel={} chat_id={} chat_type={} "
+                "live={} archive={}",
+                reason,
+                ctx.msg.channel,
+                ctx.msg.chat_id,
+                chat_type or "-",
+                live_key,
+                archive_key or "-",
+            )
+            return ctx.session.get_history(**hist_kwargs)
+
+        if not should_merge_wecom_archive(ctx.msg.channel, ctx.msg.chat_id, ctx.msg.metadata):
+            # Only log when this is a wecom turn (avoid noise for every channel).
+            if ctx.msg.channel == "wecom":
+                return _merge_skip("not_eligible")
+            return ctx.session.get_history(**hist_kwargs)
+
+        archive_cfg = self._wecom_archive_channel_config() or {}
+        if not archive_cfg:
+            logger.debug(
+                "wecom_archive merge note: no channels.wecom_archive config visible to AgentLoop "
+                "live={} archive={}",
+                live_key,
+                archive_key,
+            )
+        if archive_cfg.get("enabled") is False:
+            return _merge_skip("archive_disabled")
+        # Default True when key absent (merge_into_wecom).
+        merge_flag = archive_cfg.get("mergeIntoWecom", archive_cfg.get("merge_into_wecom", True))
+        if merge_flag is False:
+            return _merge_skip("merge_disabled")
+
+        archive_session = self._load_session_if_exists(archive_key)
+        if archive_session is None:
+            return _merge_skip("archive_missing")
+        if not archive_session.messages:
+            return _merge_skip("archive_empty")
+
+        self._maybe_trim_wecom_archive_session(archive_session)
+
+        bot_user_ids = archive_cfg.get("botUserIds") or archive_cfg.get("bot_user_ids") or []
+        bot_mention_names = (
+            archive_cfg.get("botMentionNames") or archive_cfg.get("bot_mention_names") or []
+        )
+        if not isinstance(bot_user_ids, list):
+            bot_user_ids = []
+        if not isinstance(bot_mention_names, list):
+            bot_mention_names = []
+
+        merge_max_messages = archive_cfg.get(
+            "mergeMaxMessages", archive_cfg.get("merge_max_messages", 500)
+        )
+        merge_max_age_hours = archive_cfg.get(
+            "mergeMaxAgeHours", archive_cfg.get("merge_max_age_hours", 72.0)
+        )
+        try:
+            merge_max_messages = int(merge_max_messages)
+        except (TypeError, ValueError):
+            merge_max_messages = 500
+        try:
+            merge_max_age_hours = float(merge_max_age_hours)
+        except (TypeError, ValueError):
+            merge_max_age_hours = 72.0
+
+        live_slice = ctx.session.messages[ctx.session.last_consolidated :]
+        archive_raw = archive_session.messages[archive_session.last_consolidated :]
+        archive_slice = window_archive_messages(
+            archive_raw,
+            max_messages=merge_max_messages,
+            max_age_hours=merge_max_age_hours if merge_max_age_hours > 0 else None,
+        )
+        merged = merge_wecom_group_history(
+            live_slice,
+            archive_slice,
+            bot_user_ids=bot_user_ids,
+            bot_mention_names=bot_mention_names,
+        )
+        tmp = Session(key=f"{ctx.session.key}+archive", messages=list(merged), last_consolidated=0)
+        history = tmp.get_history(**hist_kwargs)
+        logger.debug(
+            "wecom_archive merge ok live={} archive={} live_msgs={} archive_raw={} "
+            "archive_msgs={} merged_msgs={} history_msgs={} mention_names={} bot_ids={}",
+            live_key,
+            archive_key,
+            len(live_slice),
+            len(archive_raw),
+            len(archive_slice),
+            len(merged),
+            len(history),
+            len(bot_mention_names),
+            len(bot_user_ids),
+        )
+        return history
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message: per-session serial, cross-session concurrent."""
@@ -1637,7 +1801,7 @@ class AgentLoop:
             "max_tokens": self._replay_token_budget(ctx.runtime),
             "extend_to_user": False,
         }
-        ctx.history = ctx.session.get_history(**_hist_kwargs)
+        ctx.history = self._history_for_turn(ctx, **_hist_kwargs)
         self._runtime_events().record_turn_runtime(
             ctx.session_key,
             ctx.runtime,
