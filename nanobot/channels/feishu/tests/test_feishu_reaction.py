@@ -269,7 +269,7 @@ class TestStreamEndReactionCleanup:
         """resuming=True means more tool-call rounds follow; reaction must persist."""
         ch = _make_channel()
         ch.config.done_emoji = "DONE"
-        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+        ch._stream_bufs["om_001"] = _FeishuStreamBuf(
             text="partial", card_id="card_1", sequence=3, last_edit=0.0,
         )
         ch._reaction_ids["om_001"] = "rx_42"
@@ -289,13 +289,18 @@ class TestStreamEndReactionCleanup:
         ch._add_reaction.assert_not_called()
         # OnIt reaction id is still tracked for the eventual final stream end
         assert ch._reaction_ids.get("om_001") == "rx_42"
+        assert "om_001" in ch._stream_bufs
+        assert ch._stream_bufs["om_001"].card_id == "card_1"
+        assert ch._stream_bufs["om_001"].text == ""
+        ch._client.cardkit.v1.card_element.content.assert_not_called()
+        ch._client.cardkit.v1.card.settings.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_done_emoji_only_on_final_stream_end(self):
         """Across resuming rounds, done_emoji is added only on the final round."""
         ch = _make_channel()
         ch.config.done_emoji = "DONE"
-        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+        ch._stream_bufs["om_001"] = _FeishuStreamBuf(
             text="t", card_id="card_1", sequence=3, last_edit=0.0,
         )
         ch._reaction_ids["om_001"] = "rx_42"
@@ -314,10 +319,13 @@ class TestStreamEndReactionCleanup:
         ch._remove_reaction.assert_not_called()
         ch._add_reaction.assert_not_called()
 
-        # Re-prime the stream buffer for the final round (the previous stream end popped it).
-        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
-            text="t", card_id="card_1", sequence=5, last_edit=0.0,
-        )
+        # Buffer stays open for the next streaming segment on the same card.
+        assert "om_001" in ch._stream_bufs
+        assert ch._stream_bufs["om_001"].card_id == "card_1"
+        assert ch._stream_bufs["om_001"].text == ""
+
+        ch._stream_bufs["om_001"].text = "t"
+        ch._stream_bufs["om_001"].sequence = 5
         # Final stream end (resuming=False): OnIt removed, done_emoji added.
         await ch.send_delta(
             "oc_chat1", "",

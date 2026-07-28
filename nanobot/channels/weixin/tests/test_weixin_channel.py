@@ -1825,6 +1825,40 @@ async def test_stream_end_flushes_buffered_answer() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_end_resuming_does_not_send() -> None:
+    channel, _bus = _make_channel()
+    channel._client = object()
+    channel._token = "token"
+    channel._context_tokens["wx-user"] = "ctx-1"
+    channel._context_token_at["wx-user"] = time.time()
+    channel._send_text = AsyncMock()
+
+    await channel.send_delta("wx-user", "hello ", {"_stream_delta": True})
+    await channel.send_delta("wx-user", "world", stream_end=True, resuming=True)
+
+    channel._send_text.assert_not_awaited()
+    assert "wx-user" not in channel._stream_buffers
+
+
+@pytest.mark.asyncio
+async def test_stream_end_resuming_then_final_still_sends_once() -> None:
+    channel, _bus = _make_channel()
+    channel._client = object()
+    channel._token = "token"
+    channel._context_tokens["wx-user"] = "ctx-1"
+    channel._context_token_at["wx-user"] = time.time()
+    channel._send_text = AsyncMock()
+
+    await channel.send_delta("wx-user", "hello ", {"_stream_delta": True})
+    await channel.send_delta("wx-user", "world", stream_end=True, resuming=True)
+    await channel.send_delta("wx-user", "hello ", {"_stream_delta": True})
+    await channel.send_delta("wx-user", "world", {"_stream_end": True})
+
+    channel._send_text.assert_awaited_once_with("wx-user", "hello world", "ctx-1")
+    assert "wx-user" not in channel._stream_buffers
+
+
+@pytest.mark.asyncio
 async def test_stream_end_send_failure_keeps_buffer_for_retry() -> None:
     channel, _bus = _make_channel()
     channel._client = object()

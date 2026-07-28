@@ -269,6 +269,25 @@ class TestSendDelta:
         ch._client.cardkit.v1.card_element.content.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_stream_end_resuming_does_not_finalize_card(self):
+        ch = _make_channel()
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="Partial intro", card_id="card_1", sequence=3, last_edit=0.0,
+        )
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response()
+        ch._client.cardkit.v1.card.settings.return_value = _mock_content_response()
+        ch._client.im.v1.message.create.return_value = _mock_send_response("om_fb")
+
+        await ch.send_delta("oc_chat1", "", stream_end=True, resuming=True)
+
+        assert "oc_chat1" in ch._stream_bufs
+        assert ch._stream_bufs["oc_chat1"].card_id == "card_1"
+        assert ch._stream_bufs["oc_chat1"].text == ""
+        ch._client.cardkit.v1.card_element.content.assert_not_called()
+        ch._client.cardkit.v1.card.settings.assert_not_called()
+        ch._client.im.v1.message.create.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_stream_end_sends_final_update(self):
         ch = _make_channel()
         ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(

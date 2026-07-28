@@ -1255,6 +1255,7 @@ class WeixinChannel(BaseChannel):
         if meta.get("_reasoning_delta") or meta.get("_reasoning"):
             return
         is_end = stream_end or bool(meta.get("_stream_end"))
+        resuming = resuming or bool(meta.get("_resuming"))
         buffer_key = stream_id or chat_id
         # Accumulate intermediate deltas. The stream_end message's own content
         # (present when the manager coalesces deltas into the end message) is
@@ -1264,6 +1265,9 @@ class WeixinChannel(BaseChannel):
         if delta and not is_end:
             self._stream_buffers.setdefault(buffer_key, []).append(delta)
         if not is_end:
+            return
+        if resuming:
+            self._stream_buffers.pop(buffer_key, None)
             return
         full = ("".join(self._stream_buffers.get(buffer_key, [])) + (delta or "")).strip()
         await self._flush_tool_hints(chat_id)

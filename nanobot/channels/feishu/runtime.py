@@ -2209,6 +2209,7 @@ class FeishuChannel(BaseChannel):
         stream_key = self._stream_key(chat_id, meta)
         loop = asyncio.get_running_loop()
         rid_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
+        resuming = resuming or bool(meta.get("_resuming"))
 
         # --- stream end: final update or fallback ---
         if stream_end:
@@ -2218,6 +2219,12 @@ class FeishuChannel(BaseChannel):
             # working (more tool-call rounds), so leave the reaction state
             # in place — otherwise the OnIt indicator disappears prematurely
             # and the DONE reaction fires after every tool call.
+            if resuming:
+                buf = self._stream_bufs.get(stream_key)
+                if buf is not None:
+                    buf.text = ""
+                return
+
             if message_id and not resuming:
                 reaction_id = self._reaction_ids.pop(message_id, None)
                 if reaction_id:
