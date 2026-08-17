@@ -60,6 +60,38 @@ def format_tool_hints(tool_calls: list, max_length: int = 40) -> str:
     )
 
 
+class _ToolEventView:
+    """Read-only adapter exposing structured tool-event dicts to the hint formatters."""
+
+    __slots__ = ("id", "name", "arguments")
+
+    def __init__(self, event: dict) -> None:
+        self.id = event.get("call_id", "") or ""
+        self.name = event.get("name", "") or ""
+        arguments = event.get("arguments")
+        self.arguments = arguments if isinstance(arguments, dict) else {}
+
+
+def format_tool_event_lines(tool_events: list[dict] | None, max_length: int = 160) -> list[str]:
+    """Format structured tool-event dicts (``ProgressEvent.tool_events``) one line per tool.
+
+    Each event carries ``name`` plus the full ``arguments`` dict, so callers
+    that want a fuller preview (e.g. a live progress card) can format with a
+    longer limit than the batched ``content`` string produced from the default
+    ``toolHintMaxLength``.
+    """
+    if not tool_events:
+        return []
+    lines: list[str] = []
+    for event in tool_events:
+        if not isinstance(event, dict):
+            continue
+        hint = format_tool_hints([_ToolEventView(event)], max_length=max_length)
+        if hint:
+            lines.append(hint)
+    return lines
+
+
 def _get_args(tc) -> dict:
     """Extract args dict from tc.arguments, handling list/dict/None/empty."""
     if tc.arguments is None:

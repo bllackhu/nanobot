@@ -2188,3 +2188,29 @@ Set `agents.defaults.toolHintMaxLength` to control the truncation threshold:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `agents.defaults.toolHintMaxLength` | `40` | Maximum characters for tool hint display. Range: 20–500. Higher values show more of the command or path; lower values keep hints compact. |
+
+## Feishu Live Tool-Hint Card
+
+When Feishu tool hints are enabled (`channels.sendToolHints: true`), the Feishu channel shows **two surfaces** for the same tool activity:
+
+1. **Inline hints (unchanged)** — the compact batched hint appended into the answer streaming card (or sent as a standalone interactive card when no stream is active), truncated by `agents.defaults.toolHintMaxLength`.
+2. **Live progress card (new)** — a separate CardKit message that is created on the first tool call and whose single line is **replaced** on each subsequent tool call (latest overrides previous). It is finalized (streaming closed) when the turn ends and is never deleted.
+
+The live card re-formats each tool from its full arguments, so it can show longer step detail than the compact inline line:
+
+```json
+{
+  "channels": {
+    "sendToolHints": true,
+    "feishu": {
+      "liveToolHintCard": true,
+      "liveToolHintMaxLength": 200
+    }
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `channels.feishu.liveToolHintCard` | `true` | Enable the live progress card when `sendToolHints` is on. Set `false` to keep only the inline hints. |
+| `channels.feishu.liveToolHintMaxLength` | `160` | Max characters for live progress card lines. Range: 40–500. Live lines are formatted from raw tool arguments, so this can exceed the inline `agents.defaults.toolHintMaxLength`. |

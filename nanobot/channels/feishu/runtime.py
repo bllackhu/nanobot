@@ -43,6 +43,7 @@ from nanobot.config.paths import get_media_dir
 from nanobot.pairing import clear_channel
 from nanobot.utils.helpers import safe_filename
 from nanobot.utils.logging_bridge import redirect_lib_logging
+from nanobot.utils.tool_hints import format_tool_event_lines
 
 if TYPE_CHECKING:
     from lark_oapi.api.im.v1.model import MentionEvent, P2ImMessageReceiveV1
@@ -926,6 +927,7 @@ class FeishuChannel(BaseChannel):
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
+        self._live_hint_bufs: dict[str, _FeishuStreamBuf] = {}
         self._bot_open_id: str | None = None
         self._background_tasks: set[asyncio.Task] = set()
         self._reaction_ids: dict[str, str] = {}  # message_id → reaction_id
@@ -2213,6 +2215,10 @@ class FeishuChannel(BaseChannel):
 
         # --- stream end: final update or fallback ---
         if stream_end:
+            # A truly-final stream end freezes the live progress card too. On
+            # resuming=True the agent keeps working, so the live card stays live.
+            if not resuming:
+                await self._finalize_live_hint_card(chat_id, meta)
             message_id = meta.get("message_id")
             # Only finalize the OnIt -> DONE reaction transition on the truly
             # final stream end. resuming=True means the agent will keep
@@ -2370,6 +2376,11 @@ class FeishuChannel(BaseChannel):
             # separate message so the user experience stays cohesive.
             progress_event = msg.event if isinstance(msg.event, ProgressEvent) else None
 
+            if progress_event is None:
+                # A plain (final) message has no progress semantics — freeze any
+                # live progress card so its last line stays visible.
+                await self._finalize_live_hint_card(msg.chat_id, msg.metadata)
+
             if progress_event and progress_event.tool_hint:
                 hint = (msg.content or "").strip()
                 if not hint:
@@ -2383,27 +2394,42 @@ class FeishuChannel(BaseChannel):
                         "\n\n" + self._format_tool_hint_delta(hint) + "\n\n",
                         metadata=msg.metadata,
                     )
-                    return
-                # No active streaming card — send as a regular interactive card
-                # with the same 🔧 prefix style. Existing topics stay threaded;
-                # new topics are created only when reply-to-message is enabled.
-                card = json.dumps(
-                    {"config": {"wide_screen_mode": True}, "elements": [
-                        {"tag": "markdown", "content": self._format_tool_hint_delta(hint)},
-                    ]},
-                    ensure_ascii=False,
-                )
-                _th_msg_id = self._thread_reply_target(msg.metadata)
-                if _th_msg_id:
-                    await loop.run_in_executor(
-                        None, lambda: self._reply_message_sync(
-                            _th_msg_id, "interactive", card,
-                            reply_in_thread=self._should_use_reply_in_thread(msg.metadata),
-                        ),
-                    )
                 else:
-                    await loop.run_in_executor(
-                        None, self._send_message_sync, receive_id_type, msg.chat_id, "interactive", card
+                    # No active streaming card — send as a regular interactive card
+                    # with the same 🔧 prefix style. Existing topics stay threaded;
+                    # new topics are created only when reply-to-message is enabled.
+                    card = json.dumps(
+                        {"config": {"wide_screen_mode": True}, "elements": [
+                            {"tag": "markdown", "content": self._format_tool_hint_delta(hint)},
+                        ]},
+                        ensure_ascii=False,
+                    )
+                    _th_msg_id = self._thread_reply_target(msg.metadata)
+                    if _th_msg_id:
+                        await loop.run_in_executor(
+                            None, lambda: self._reply_message_sync(
+                                _th_msg_id, "interactive", card,
+                                reply_in_thread=self._should_use_reply_in_thread(msg.metadata),
+                            ),
+                        )
+                    else:
+                        await loop.run_in_executor(
+                            None, self._send_message_sync, receive_id_type, msg.chat_id, "interactive", card
+                        )
+                # Dual UX: drive the dedicated live progress card from the same
+                # event — one line per tool, latest line replaces the previous.
+                lines = format_tool_event_lines(
+                    progress_event.tool_events,
+                    max_length=self.config.live_tool_hint_max_length,
+                )
+                if not lines:
+                    lines = [ln for ln in self.__class__._format_tool_hint_lines(hint).split("\n") if ln.strip()]
+                for idx, line in enumerate(lines):
+                    await self._update_live_hint_card(
+                        msg.chat_id,
+                        msg.metadata,
+                        f"{self.config.tool_hint_prefix} {line}",
+                        force=(idx == len(lines) - 1),
                     )
                 return
 
@@ -2815,3 +2841,104 @@ class FeishuChannel(BaseChannel):
         return "\n".join(
             f"{self.config.tool_hint_prefix} {ln}" for ln in lines if ln.strip()
         )
+
+    async def _update_live_hint_card(
+        self,
+        chat_id: str,
+        metadata: dict[str, Any] | None,
+        line: str,
+        *,
+        force: bool = False,
+    ) -> None:
+        """Show *line* on the dedicated live progress card (replace, not append).
+
+        The card is created on first use; every tool hint replaces its single
+        line so the user sees work advance without one message per tool.
+        Updates are throttled to ``_STREAM_EDIT_INTERVAL`` holding the latest
+        text; *force* bypasses the throttle so the final line of a batch is
+        always flushed to the card.
+        """
+        if not self.config.live_tool_hint_card:
+            return
+        line = (line or "").strip()
+        if not line:
+            return
+        loop = asyncio.get_running_loop()
+        stream_key = self._stream_key(chat_id, metadata)
+        buf = self._live_hint_bufs.get(stream_key)
+        if buf is None:
+            buf = _FeishuStreamBuf()
+            self._live_hint_bufs[stream_key] = buf
+        buf.text = line
+        now = time.monotonic()
+        if buf.card_id is None:
+            rid_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
+            meta = metadata or {}
+            use_reply_in_thread = self._should_use_reply_in_thread(meta)
+            reply_msg_id = self._thread_reply_target(meta)
+            card_id = await loop.run_in_executor(
+                None,
+                lambda: self._create_streaming_card_sync(
+                    rid_type,
+                    chat_id,
+                    reply_msg_id,
+                    reply_in_thread=use_reply_in_thread,
+                ),
+            )
+            if not card_id:
+                return
+            ok, sequence = await loop.run_in_executor(
+                None, self._stream_update_text_with_reopen_sync, card_id, line, 1
+            )
+            if ok:
+                buf.card_id = card_id
+                buf.sequence = sequence
+                buf.last_edit = now
+            else:
+                await loop.run_in_executor(
+                    None, self._close_streaming_mode_sync, card_id, sequence + 1
+                )
+        elif force or (now - buf.last_edit) >= self._STREAM_EDIT_INTERVAL:
+            ok, buf.sequence = await loop.run_in_executor(
+                None,
+                self._stream_update_text_with_reopen_sync,
+                buf.card_id,
+                buf.text,
+                buf.sequence + 1,
+            )
+            if ok:
+                buf.last_edit = now
+
+    async def _finalize_live_hint_card(
+        self, chat_id: str, metadata: dict[str, Any] | None
+    ) -> None:
+        """Freeze the live progress card (flush latest line, close streaming)."""
+        stream_key = self._stream_key(chat_id, metadata)
+        buf = self._live_hint_bufs.pop(stream_key, None)
+        if not buf or not buf.card_id:
+            return
+        loop = asyncio.get_running_loop()
+        if buf.text:
+            buf.sequence += 1
+            ok, buf.sequence = await loop.run_in_executor(
+                None,
+                self._stream_update_text_with_reopen_sync,
+                buf.card_id,
+                buf.text,
+                buf.sequence,
+            )
+            if not ok:
+                buf.sequence += 1
+                await loop.run_in_executor(
+                    None, self._close_streaming_mode_sync, buf.card_id, buf.sequence
+                )
+                return
+        buf.sequence += 1
+        closed = await loop.run_in_executor(
+            None, self._close_streaming_mode_sync, buf.card_id, buf.sequence
+        )
+        if not closed:
+            buf.sequence += 1
+            await loop.run_in_executor(
+                None, self._close_streaming_mode_sync, buf.card_id, buf.sequence
+            )

@@ -490,6 +490,8 @@ If QR login is unavailable for your account, use manual setup below.
       "doneEmoji": "DONE",
       "listenEmoji": "Pin",
       "toolHintPrefix": "🔧",
+      "liveToolHintCard": true,
+      "liveToolHintMaxLength": 160,
       "streaming": true,
       "domain": "feishu"
     }
@@ -505,6 +507,8 @@ If QR login is unavailable for your account, use manual setup below.
 > `doneEmoji`: Optional emoji for "completed" status (e.g., `DONE`, `OK`, `HEART`). When set, bot adds this reaction after removing `reactEmoji`.
 > `listenEmoji`: Emoji on **listen** history-only ingest (unmentioned group messages). Default: `"Pin"`. Set `""` to disable (silent). This reaction is persistent (no stream cleanup). Does not affect @mention turns (those still use `reactEmoji` / `doneEmoji`).
 > `toolHintPrefix`: Prefix for inline tool hints in streaming cards (default: `🔧`).
+> `liveToolHintCard`: When tool hints are enabled (`channels.sendToolHints: true`), show a **live progress card** — a separate message whose single line is replaced on each tool call so users see progress without chat spam. Default: `true`. Set `false` to keep only the inline hints.
+> `liveToolHintMaxLength`: Max preview length for live progress card lines (default: `160`, range 40–500). Live-card lines are re-formatted from the full tool arguments, so this can be much longer than the compact inline `agents.defaults.toolHintMaxLength`. See [Tool hints](../configuration.md#tool-hints).
 > `domain`: `"feishu"` (default) for China (open.feishu.cn), `"lark"` for international Lark (open.larksuite.com).
 
 **3. Run**

@@ -1,7 +1,7 @@
 """Tests for tool hint formatting (nanobot.utils.tool_hints)."""
 
 from nanobot.providers.base import ToolCallRequest
-from nanobot.utils.tool_hints import format_tool_hints
+from nanobot.utils.tool_hints import format_tool_event_lines, format_tool_hints
 
 
 def _tc(name: str, args) -> ToolCallRequest:
@@ -325,3 +325,49 @@ class TestToolHintMalformedCalls:
         """A degenerate call must not suppress hints for the valid calls beside it."""
         result = _hint([_tc(None, None), _tc("read_file", {"path": "foo.txt"})])
         assert result == "read foo.txt"
+
+
+class TestFormatToolEventLines:
+    """format_tool_event_lines formats structured ProgressEvent.tool_events dicts."""
+
+    def _events(self, *items) -> list[dict]:
+        out = []
+        for i, (name, args) in enumerate(items):
+            out.append({
+                "version": 1,
+                "phase": "start",
+                "call_id": f"call_{i}",
+                "name": name,
+                "arguments": args,
+                "result": None,
+                "error": None,
+                "files": [],
+                "embeds": [],
+            })
+        return out
+
+    def test_returns_one_line_per_tool(self):
+        events = self._events(
+            ("read_file", {"path": "docs/api.md"}),
+            ("grep", {"pattern": "TODO"}),
+        )
+        lines = format_tool_event_lines(events)
+        assert lines == ['read docs/api.md', 'grep "TODO"']
+
+    def test_empty_and_none_input(self):
+        assert format_tool_event_lines(None) == []
+        assert format_tool_event_lines([]) == []
+        assert format_tool_event_lines([None, "not-a-dict"]) == []
+
+    def test_respects_max_length(self):
+        cmd = "cd /very/long/path/to/some/project && npm run build && npm test"
+        events = self._events(("exec", {"command": cmd}))
+        short = format_tool_event_lines(events, max_length=40)[0]
+        long = format_tool_event_lines(events, max_length=160)[0]
+        assert len(long) > len(short)
+        assert "npm test" in long
+
+    def test_malformed_name_skipped(self):
+        events = self._events(("", {"path": "x"}))
+        assert format_tool_event_lines(events) == []
+
