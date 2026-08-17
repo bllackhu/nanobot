@@ -15,7 +15,11 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.feishu.runtime import FeishuChannel, FeishuConfig, _FeishuStreamBuf
 
 
-def _make_channel(streaming: bool = True, reply_to_message: bool = False) -> FeishuChannel:
+def _make_channel(
+    streaming: bool = True,
+    reply_to_message: bool = False,
+    hint_mode: str = "inline",
+) -> FeishuChannel:
     config = FeishuConfig(
         enabled=True,
         app_id="cli_test",
@@ -23,11 +27,26 @@ def _make_channel(streaming: bool = True, reply_to_message: bool = False) -> Fei
         allow_from=["*"],
         streaming=streaming,
         reply_to_message=reply_to_message,
+        hint_mode=hint_mode,
     )
     ch = FeishuChannel(config, MessageBus())
     ch._client = MagicMock()
     ch._loop = None
     return ch
+
+
+def _tool_event(call_id: str, name: str, arguments: dict) -> dict:
+    return {
+        "version": 1,
+        "phase": "start",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+        "result": None,
+        "error": None,
+        "files": [],
+        "embeds": [],
+    }
 
 
 def _mock_create_card_response(card_id: str = "card_stream_001"):
@@ -471,13 +490,17 @@ class TestToolHintInlineStreaming:
 
         msg = OutboundMessage(
             channel="feishu", chat_id="oc_chat1",
-            content='web_fetch("https://example.com")',
-            event=ProgressEvent(content='web_fetch("https://example.com")', tool_hint=True),
+            content='fetch("https://example.com")',
+            event=ProgressEvent(
+                content='fetch("https://example.com")',
+                tool_hint=True,
+                tool_events=[_tool_event("call-1", "web_fetch", {"url": "https://example.com"})],
+            ),
         )
         await ch.send(msg)
 
         buf = ch._stream_bufs["oc_chat1"]
-        assert '🔧 web_fetch("https://example.com")' in buf.text
+        assert '🔧 fetch("https://example.com")' in buf.text
         assert buf.sequence == 3
         ch._client.cardkit.v1.card_element.content.assert_called_once()
         ch._client.im.v1.message.create.assert_not_called()
@@ -508,7 +531,11 @@ class TestToolHintInlineStreaming:
         msg = OutboundMessage(
             channel="feishu", chat_id="oc_chat1",
             content='read_file("path")',
-            event=ProgressEvent(content='read_file("path")', tool_hint=True),
+            event=ProgressEvent(
+                content='read_file("path")',
+                tool_hint=True,
+                tool_events=[_tool_event("call-2", "read_file", {"path": "path"})],
+            ),
         )
         await ch.send(msg)
 
@@ -523,7 +550,11 @@ class TestToolHintInlineStreaming:
         msg = OutboundMessage(
             channel="feishu", chat_id="oc_chat1",
             content='read_file("path")',
-            event=ProgressEvent(content='read_file("path")', tool_hint=True),
+            event=ProgressEvent(
+                content='read_file("path")',
+                tool_hint=True,
+                tool_events=[_tool_event("call-3", "read_file", {"path": "path"})],
+            ),
             metadata={"message_id": "om_001", "chat_type": "group"},
         )
         await ch.send(msg)
@@ -541,7 +572,11 @@ class TestToolHintInlineStreaming:
         msg = OutboundMessage(
             channel="feishu", chat_id="oc_chat1",
             content='read_file("path")',
-            event=ProgressEvent(content='read_file("path")', tool_hint=True),
+            event=ProgressEvent(
+                content='read_file("path")',
+                tool_hint=True,
+                tool_events=[_tool_event("call-4", "read_file", {"path": "path"})],
+            ),
             metadata={
                 "message_id": "om_001",
                 "chat_type": "group",
@@ -565,7 +600,11 @@ class TestToolHintInlineStreaming:
         msg = OutboundMessage(
             channel="feishu", chat_id="oc_chat1",
             content='read_file("path")',
-            event=ProgressEvent(content='read_file("path")', tool_hint=True),
+            event=ProgressEvent(
+                content='read_file("path")',
+                tool_hint=True,
+                tool_events=[_tool_event("call-5", "read_file", {"path": "path"})],
+            ),
             metadata={"message_id": "om_001", "chat_type": "group"},
         )
         await ch.send(msg)
@@ -587,14 +626,22 @@ class TestToolHintInlineStreaming:
         msg1 = OutboundMessage(
             channel="feishu", chat_id="oc_chat1",
             content='$ cd /project',
-            event=ProgressEvent(content='$ cd /project', tool_hint=True),
+            event=ProgressEvent(
+                content='$ cd /project',
+                tool_hint=True,
+                tool_events=[_tool_event("call-6", "exec", {"command": "cd /project"})],
+            ),
         )
         await ch.send(msg1)
 
         msg2 = OutboundMessage(
             channel="feishu", chat_id="oc_chat1",
             content='$ git status',
-            event=ProgressEvent(content='$ git status', tool_hint=True),
+            event=ProgressEvent(
+                content='$ git status',
+                tool_hint=True,
+                tool_events=[_tool_event("call-7", "exec", {"command": "git status"})],
+            ),
         )
         await ch.send(msg2)
 
@@ -634,7 +681,11 @@ class TestToolHintInlineStreaming:
             msg = OutboundMessage(
                 channel="feishu", chat_id="oc_chat1",
                 content=content,
-                event=ProgressEvent(content=content, tool_hint=True),
+                event=ProgressEvent(
+                    content=content,
+                    tool_hint=True,
+                    tool_events=[_tool_event("call-8", "read_file", {"path": "x"})],
+                ),
             )
             await ch.send(msg)
 

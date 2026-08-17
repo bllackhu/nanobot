@@ -2189,22 +2189,23 @@ Set `agents.defaults.toolHintMaxLength` to control the truncation threshold:
 |--------|---------|-------------|
 | `agents.defaults.toolHintMaxLength` | `40` | Maximum characters for tool hint display. Range: 20–500. Higher values show more of the command or path; lower values keep hints compact. |
 
-## Feishu Live Tool-Hint Card
+## Feishu Tool-Hint Mode
 
-When Feishu tool hints are enabled (`channels.sendToolHints: true`), the Feishu channel shows **two surfaces** for the same tool activity:
+When Feishu tool hints are enabled (`channels.sendToolHints: true`), the Feishu channel shows tool activity on exactly **one** surface, controlled by `channels.feishu.hintMode`:
 
-1. **Inline hints (unchanged)** — the compact batched hint appended into the answer streaming card (or sent as a standalone interactive card when no stream is active), truncated by `agents.defaults.toolHintMaxLength`.
-2. **Live progress card (new)** — a separate CardKit message that is created on the first tool call and whose single line is **replaced** on each subsequent tool call (latest overrides previous). It is finalized (streaming closed) when the turn ends and is never deleted.
+1. **`"live"` (default)** — a separate CardKit **live progress card** whose single line is **replaced** on each tool call (latest overrides previous), so users see progress without chat spam. It also shows token-consolidation status while the agent is compacting history. The card is finalized (streaming closed) when the turn ends and is never deleted.
+2. **`"inline"`** — the compact batched hint appended into the answer streaming card (or sent as a standalone interactive card when no stream is active), truncated by `agents.defaults.toolHintMaxLength`. No live card is created.
 
-The live card re-formats each tool from its full arguments, so it can show longer step detail than the compact inline line:
+The live card re-formats each tool from its full arguments, so it can show longer step detail than the compact inline line. Because the two surfaces are mutually exclusive, operators choose one or the other — they never render at the same time.
 
 ```json
 {
   "channels": {
     "sendToolHints": true,
     "feishu": {
-      "liveToolHintCard": true,
-      "liveToolHintMaxLength": 200
+      "hintMode": "live",
+      "liveToolHintMaxLength": 200,
+      "liveToolHintHeartbeatSeconds": 10
     }
   }
 }
@@ -2212,5 +2213,8 @@ The live card re-formats each tool from its full arguments, so it can show longe
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `channels.feishu.liveToolHintCard` | `true` | Enable the live progress card when `sendToolHints` is on. Set `false` to keep only the inline hints. |
+| `channels.feishu.hintMode` | `"live"` | Which tool-hint surface to show: `"inline"` (compact hint in the answer card) or `"live"` (dedicated live progress card). They are mutually exclusive — `liveToolHintCard` was removed in favor of this switch. |
 | `channels.feishu.liveToolHintMaxLength` | `160` | Max characters for live progress card lines. Range: 40–500. Live lines are formatted from raw tool arguments, so this can exceed the inline `agents.defaults.toolHintMaxLength`. |
+| `channels.feishu.liveToolHintHeartbeatSeconds` | `10` | How often (seconds) the live card refreshes with a subtle growing pulse (`·`, `··`, …) while a long-running tool produces no new hint. `0` disables the heartbeat. Only applies in `hintMode: "live"`. |
+
+In `live` mode the card also shows **consolidation status**: while the agent runs token-consolidation it emits `consolidating history (N/M tokens)` and a final `history consolidated` line on the live card. In `inline` mode these status lines are skipped (they only make sense on the live card).

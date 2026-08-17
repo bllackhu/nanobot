@@ -30,10 +30,25 @@ def mock_feishu_channel():
     config.encrypt_key = None
     config.verification_token = None
     config.tool_hint_prefix = "\U0001f527"  # 🔧
+    config.hint_mode = "inline"
     bus = MagicMock()
     channel = FeishuChannel(config, bus)
     channel._client = MagicMock()
     return channel
+
+
+def _tool_event(call_id: str, name: str, arguments: dict) -> dict:
+    return {
+        "version": 1,
+        "phase": "start",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+        "result": None,
+        "error": None,
+        "files": [],
+        "embeds": [],
+    }
 
 
 def _get_tool_hint_card(mock_send):
@@ -51,7 +66,10 @@ async def test_tool_hint_sends_interactive_card(mock_feishu_channel):
         channel="feishu",
         chat_id="oc_123456",
         content='web_search("test query")',
-        event=ProgressEvent(tool_hint=True),
+        event=ProgressEvent(
+            tool_hint=True,
+            tool_events=[_tool_event("call-1", "web_search", {"query": "test query"})],
+        ),
     )
 
     with patch.object(mock_feishu_channel, '_send_message_sync') as mock_send:
@@ -72,7 +90,10 @@ async def test_tool_hint_empty_content_does_not_send(mock_feishu_channel):
         channel="feishu",
         chat_id="oc_123456",
         content="   ",  # whitespace only
-        event=ProgressEvent(tool_hint=True),
+        event=ProgressEvent(
+            tool_hint=True,
+            tool_events=[_tool_event("call-2", "read_file", {"path": "x"})],
+        ),
     )
 
     with patch.object(mock_feishu_channel, '_send_message_sync') as mock_send:
@@ -107,7 +128,13 @@ async def test_tool_hint_multiple_tools_in_one_message(mock_feishu_channel):
         channel="feishu",
         chat_id="oc_123456",
         content='web_search("query"), read_file("/path/to/file")',
-        event=ProgressEvent(tool_hint=True),
+        event=ProgressEvent(
+            tool_hint=True,
+            tool_events=[
+                _tool_event("call-3", "web_search", {"query": "query"}),
+                _tool_event("call-4", "read_file", {"path": "/path/to/file"}),
+            ],
+        ),
     )
 
     with patch.object(mock_feishu_channel, '_send_message_sync') as mock_send:
@@ -127,7 +154,13 @@ async def test_tool_hint_new_format_basic(mock_feishu_channel):
         channel="feishu",
         chat_id="oc_123456",
         content='read src/main.py, grep "TODO"',
-        event=ProgressEvent(tool_hint=True),
+        event=ProgressEvent(
+            tool_hint=True,
+            tool_events=[
+                _tool_event("call-5", "read_file", {"path": "src/main.py"}),
+                _tool_event("call-6", "grep", {"pattern": "TODO"}),
+            ],
+        ),
     )
 
     with patch.object(mock_feishu_channel, '_send_message_sync') as mock_send:
@@ -146,7 +179,13 @@ async def test_tool_hint_new_format_with_comma_in_quotes(mock_feishu_channel):
         channel="feishu",
         chat_id="oc_123456",
         content='grep "hello, world", $ echo test',
-        event=ProgressEvent(tool_hint=True),
+        event=ProgressEvent(
+            tool_hint=True,
+            tool_events=[
+                _tool_event("call-7", "grep", {"pattern": "hello, world"}),
+                _tool_event("call-8", "exec", {"command": "echo test"}),
+            ],
+        ),
     )
 
     with patch.object(mock_feishu_channel, '_send_message_sync') as mock_send:
@@ -165,7 +204,13 @@ async def test_tool_hint_new_format_with_folding(mock_feishu_channel):
         channel="feishu",
         chat_id="oc_123456",
         content='read path × 3, grep "pattern"',
-        event=ProgressEvent(tool_hint=True),
+        event=ProgressEvent(
+            tool_hint=True,
+            tool_events=[
+                _tool_event("call-9", "read_file", {"path": "path"}),
+                _tool_event("call-10", "grep", {"pattern": "pattern"}),
+            ],
+        ),
     )
 
     with patch.object(mock_feishu_channel, '_send_message_sync') as mock_send:
@@ -184,7 +229,10 @@ async def test_tool_hint_new_format_mcp(mock_feishu_channel):
         channel="feishu",
         chat_id="oc_123456",
         content='4_5v::analyze_image("photo.jpg")',
-        event=ProgressEvent(tool_hint=True),
+        event=ProgressEvent(
+            tool_hint=True,
+            tool_events=[_tool_event("call-11", "mcp_4_5v__analyze_image", {"path": "photo.jpg"})],
+        ),
     )
 
     with patch.object(mock_feishu_channel, '_send_message_sync') as mock_send:
@@ -202,7 +250,13 @@ async def test_tool_hint_keeps_commas_inside_arguments(mock_feishu_channel):
         channel="feishu",
         chat_id="oc_123456",
         content='web_search("foo, bar"), read_file("/path/to/file")',
-        event=ProgressEvent(tool_hint=True),
+        event=ProgressEvent(
+            tool_hint=True,
+            tool_events=[
+                _tool_event("call-12", "web_search", {"query": "foo, bar"}),
+                _tool_event("call-13", "read_file", {"path": "/path/to/file"}),
+            ],
+        ),
     )
 
     with patch.object(mock_feishu_channel, '_send_message_sync') as mock_send:

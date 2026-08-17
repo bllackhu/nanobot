@@ -887,3 +887,60 @@ class TestToolEventProgress:
         assert len(outbound) == 1
         assert outbound[0].content == "Done"
         assert not isinstance(outbound[0].event, TurnEndEvent)
+
+
+class TestConsolidationStatusWiring:
+    """The agent loop routes Consolidator status through the turn's progress callback."""
+
+    @pytest.mark.asyncio
+    async def test_consolidation_status_lands_on_bus_progress(self, tmp_path: Path) -> None:
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Done", tool_calls=[]))
+        loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+        _attach_webui_runtime_events(loop, bus)
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        status_emitted = asyncio.Event()
+        status_texts: list[str] = []
+
+        async def fake_consolidate(session, *, runtime, replay_max_messages=None) -> None:
+            cb = loop._turn_status_callbacks.get(session.key)
+            assert cb is not None
+            from nanobot.utils.progress_events import invoke_on_progress_status
+
+            await invoke_on_progress_status(cb, "consolidating history (1200/8000 tokens)")
+            status_texts.append("round")
+            await invoke_on_progress_status(cb, "history consolidated")
+            status_texts.append("done")
+            status_emitted.set()
+
+        loop.consolidator.maybe_consolidate_by_tokens = fake_consolidate  # type: ignore[method-assign]
+
+        await loop._dispatch(InboundMessage(
+            channel="telegram",
+            sender_id="u1",
+            chat_id="chat1",
+            content="say hello",
+        ))
+
+        outbound = []
+        while bus.outbound_size > 0:
+            outbound.append(await bus.consume_outbound())
+
+        status_msgs = [
+            m
+            for m in outbound
+            if isinstance(m.event, ProgressEvent)
+            and m.event.tool_hint
+            and m.event.tool_events is None
+            and "consolidat" in (m.content or "")
+        ]
+        assert status_msgs, "expected consolidation status events on the bus"
+        assert {status_msgs[0].content, status_msgs[1].content} == {
+            "consolidating history (1200/8000 tokens)",
+            "history consolidated",
+        }
+        assert status_msgs[0].chat_id == "chat1"
+        assert status_msgs[1].chat_id == "chat1"

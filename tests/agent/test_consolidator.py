@@ -503,6 +503,105 @@ class TestConsolidatorTokenBudget:
         assert session.last_consolidated == 61
 
 
+class TestConsolidatorStatusHint:
+    """Consolidator emits status hints through its injected on_status callback."""
+
+    @pytest.fixture
+    def status_consolidator(self, store):
+        sessions = MagicMock()
+        sessions.save = MagicMock()
+        _session_cache: dict[str, MagicMock] = {}
+        sessions.get_or_create = MagicMock(side_effect=lambda key: _session_cache.get(key, MagicMock()))
+        sessions._session_cache = _session_cache
+        status_calls: list[str] = []
+
+        async def on_status(session_key: str, content: str) -> None:
+            status_calls.append((session_key, content))
+
+        c = Consolidator(
+            store=store,
+            sessions=sessions,
+            build_messages=MagicMock(return_value=[]),
+            get_tool_definitions=MagicMock(return_value=[]),
+            on_status=on_status,
+        )
+        c.status_calls = status_calls
+        return c
+
+    async def test_emits_round_and_done_status_when_over_budget(
+        self, status_consolidator, runtime
+    ):
+        consolidator = status_consolidator
+        consolidator._SAFETY_BUFFER = 0
+        session = MagicMock()
+        session.last_consolidated = 0
+        session.key = "test:status"
+        session.metadata = {}
+        session.messages = [
+            {"role": "user" if i in {0, 50} else "assistant", "content": f"m{i}"}
+            for i in range(70)
+        ]
+        consolidator.sessions._session_cache[session.key] = session
+        consolidator.estimate_session_prompt_tokens = MagicMock(
+            side_effect=[(1200, "tiktoken"), (400, "tiktoken")]
+        )
+        consolidator.archive = AsyncMock(return_value=True)
+
+        await consolidator.maybe_consolidate_by_tokens(session, runtime=runtime)
+
+        assert consolidator.archive.await_count == 1
+        assert len(consolidator.status_calls) == 2
+        first_key, first_content = consolidator.status_calls[0]
+        assert first_key == "test:status"
+        assert "consolidating history" in first_content
+        assert "1200" in first_content
+        second_key, second_content = consolidator.status_calls[1]
+        assert second_key == "test:status"
+        assert second_content == "history consolidated"
+
+    async def test_no_status_when_within_budget(self, status_consolidator, runtime):
+        consolidator = status_consolidator
+        session = MagicMock()
+        session.last_consolidated = 0
+        session.messages = [{"role": "user", "content": "hi"}]
+        session.key = "test:status-idle"
+        consolidator.sessions._session_cache[session.key] = session
+        consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(100, "tiktoken"))
+        consolidator.archive = AsyncMock(return_value=True)
+
+        await consolidator.maybe_consolidate_by_tokens(session, runtime=runtime)
+
+        consolidator.archive.assert_not_called()
+        assert consolidator.status_calls == []
+
+    async def test_omits_done_when_archive_falls_back(self, status_consolidator, runtime):
+        """When the LLM falls back to raw-dump (archive returns None), only the
+        round status is emitted — no misleading 'history consolidated'."""
+        consolidator = status_consolidator
+        consolidator._SAFETY_BUFFER = 0
+        session = MagicMock()
+        session.last_consolidated = 0
+        session.key = "test:status-fallback"
+        session.metadata = {}
+        session.messages = [
+            {"role": "user" if i in {0, 50} else "assistant", "content": f"m{i}"}
+            for i in range(70)
+        ]
+        consolidator.sessions._session_cache[session.key] = session
+        consolidator.estimate_session_prompt_tokens = MagicMock(
+            side_effect=[(1200, "tiktoken"), (400, "tiktoken")]
+        )
+        consolidator.archive = AsyncMock(return_value=None)
+
+        await consolidator.maybe_consolidate_by_tokens(session, runtime=runtime)
+
+        assert consolidator.archive.await_count == 1
+        assert len(consolidator.status_calls) == 1
+        content = consolidator.status_calls[0][1]
+        assert "consolidating history" in content
+        assert "history consolidated" not in content
+
+
 class TestCompactIdleSession:
     """Tests for Consolidator.compact_idle_session — lock-protected idle truncation."""
 

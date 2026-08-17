@@ -86,6 +86,7 @@ from nanobot.utils.document import extract_documents, reference_non_image_attach
 from nanobot.utils.helpers import image_placeholder_text
 from nanobot.utils.helpers import truncate_text as truncate_text_fn
 from nanobot.utils.llm_runtime import LLMRuntime
+from nanobot.utils.progress_events import invoke_on_progress_status
 from nanobot.utils.runtime import (
     EMPTY_FINAL_RESPONSE_MESSAGE,
 )
@@ -406,6 +407,7 @@ class AgentLoop:
         self._concurrency_gate: asyncio.Semaphore | None = (
             asyncio.Semaphore(_max) if _max > 0 else None
         )
+        self._turn_status_callbacks: dict[str, Callable[..., Awaitable[None]]] = {}
         self.consolidator = Consolidator(
             store=self.context.memory,
             sessions=self.sessions,
@@ -413,6 +415,7 @@ class AgentLoop:
             get_tool_definitions=self.tools.get_definitions,
             consolidation_ratio=consolidation_ratio,
             unified_session=unified_session,
+            on_status=self._consolidation_status,
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,
@@ -1444,6 +1447,18 @@ class AgentLoop:
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
 
+    async def _consolidation_status(self, session_key: str, content: str) -> None:
+        """Route consolidation status to the active turn's progress callback.
+
+        Status events reuse ``tool_hint=True`` (via ``invoke_on_progress_status``)
+        so they flow through the same hint surface (e.g. the Feishu live progress
+        card).  The callback is registered per-session for the duration of a turn.
+        """
+        cb = self._turn_status_callbacks.get(session_key)
+        if cb is None:
+            return
+        await invoke_on_progress_status(cb, content)
+
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
@@ -1478,13 +1493,18 @@ class AgentLoop:
         if pending:
             logger.info("Memory compact triggered for session {}", key)
 
-        await self.consolidator.maybe_consolidate_by_tokens(
-            session,
-            runtime=runtime,
-            replay_max_messages=replay_max_messages_for_context(
-                runtime.context_window_tokens
-            ),
-        )
+        if on_progress is not None:
+            self._turn_status_callbacks[key] = on_progress
+        try:
+            await self.consolidator.maybe_consolidate_by_tokens(
+                session,
+                runtime=runtime,
+                replay_max_messages=replay_max_messages_for_context(
+                    runtime.context_window_tokens
+                ),
+            )
+        finally:
+            self._turn_status_callbacks.pop(key, None)
         is_subagent = msg.sender_id == "subagent"
         if is_subagent and self._persist_subagent_followup(session, msg):
             logger.debug("Subagent result persisted for session {}", key)
@@ -1613,6 +1633,18 @@ class AgentLoop:
             tools=tools,
         )
 
+        if ctx.on_progress is None:
+            # Build the bus progress callback eagerly so consolidation status
+            # can reach the channel's hint surface even during _state_build.
+            ctx.on_progress = await self._build_bus_progress_callback(msg)
+        if ctx.on_progress is not None:
+            self._turn_status_callbacks[key] = ctx.on_progress
+        try:
+            return await self._run_turn_state_machine(ctx)
+        finally:
+            self._turn_status_callbacks.pop(key, None)
+
+    async def _run_turn_state_machine(self, ctx: TurnContext) -> OutboundMessage | None:
         while ctx.state is not TurnState.DONE:
             handler_name = f"_state_{ctx.state.name.lower()}"
             handler = getattr(self, handler_name, None)

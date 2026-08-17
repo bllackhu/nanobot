@@ -40,6 +40,21 @@ async def invoke_on_progress(
     await on_progress(content, tool_hint=tool_hint)
 
 
+async def invoke_on_progress_status(
+    on_progress: Callable[..., Awaitable[None]],
+    content: str,
+    *,
+    phase: str = "consolidation",
+) -> None:
+    """Emit a status line (e.g. token-consolidation progress) over on_progress.
+
+    Status events reuse ``tool_hint=True`` so they flow through the same hint
+    surface (e.g. the Feishu live progress card); they carry no tool_events.
+    Channels that only render inline tool hints may skip them.
+    """
+    await on_progress(content, tool_hint=True)
+
+
 async def invoke_file_edit_progress(
     on_progress: Callable[..., Awaitable[None]],
     file_edit_events: list[dict[str, Any]],

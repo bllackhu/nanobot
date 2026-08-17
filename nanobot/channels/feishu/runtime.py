@@ -878,6 +878,8 @@ class _FeishuStreamBuf:
     card_id: str | None = None
     sequence: int = 0
     last_edit: float = 0.0
+    last_heartbeat: float = 0.0
+    heartbeat_pulse: int = 0
 
 
 class FeishuChannel(BaseChannel):
@@ -928,6 +930,7 @@ class FeishuChannel(BaseChannel):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
         self._live_hint_bufs: dict[str, _FeishuStreamBuf] = {}
+        self._live_hint_heartbeat_tasks: dict[str, asyncio.Task] = {}
         self._bot_open_id: str | None = None
         self._background_tasks: set[asyncio.Task] = set()
         self._reaction_ids: dict[str, str] = {}  # message_id → reaction_id
@@ -1101,6 +1104,9 @@ class FeishuChannel(BaseChannel):
         Reference: https://github.com/larksuite/oapi-sdk-python/blob/v2_main/lark_oapi/ws/client.py#L86
         """
         self._running = False
+        for stream_key in list(self._live_hint_heartbeat_tasks):
+            self._cancel_live_hint_heartbeat(stream_key)
+        self._live_hint_bufs.clear()
         await self._ws_runner.stop_client(self.name)
         self.logger.info("bot stopped")
 
@@ -2385,39 +2391,15 @@ class FeishuChannel(BaseChannel):
                 hint = (msg.content or "").strip()
                 if not hint:
                     return
-                buf = self._stream_bufs.get(self._stream_key(msg.chat_id, msg.metadata))
-                if buf and buf.card_id:
-                    # Delegate to send_delta so tool hints get the same
-                    # throttling (and card creation) as regular text deltas.
-                    await self.send_delta(
-                        msg.chat_id,
-                        "\n\n" + self._format_tool_hint_delta(hint) + "\n\n",
-                        metadata=msg.metadata,
-                    )
-                else:
-                    # No active streaming card — send as a regular interactive card
-                    # with the same 🔧 prefix style. Existing topics stay threaded;
-                    # new topics are created only when reply-to-message is enabled.
-                    card = json.dumps(
-                        {"config": {"wide_screen_mode": True}, "elements": [
-                            {"tag": "markdown", "content": self._format_tool_hint_delta(hint)},
-                        ]},
-                        ensure_ascii=False,
-                    )
-                    _th_msg_id = self._thread_reply_target(msg.metadata)
-                    if _th_msg_id:
-                        await loop.run_in_executor(
-                            None, lambda: self._reply_message_sync(
-                                _th_msg_id, "interactive", card,
-                                reply_in_thread=self._should_use_reply_in_thread(msg.metadata),
-                            ),
-                        )
-                    else:
-                        await loop.run_in_executor(
-                            None, self._send_message_sync, receive_id_type, msg.chat_id, "interactive", card
-                        )
-                # Dual UX: drive the dedicated live progress card from the same
-                # event — one line per tool, latest line replaces the previous.
+                if self.config.hint_mode == "inline":
+                    if not progress_event.tool_events:
+                        # Status events (e.g. token-consolidation) have no tool
+                        # events and are only meaningful on the live card.
+                        return
+                    await self._send_inline_tool_hint(msg, hint, receive_id_type, loop)
+                    return
+                # Live mode: drive the dedicated live progress card only —
+                # one line per tool, latest line replaces the previous.
                 lines = format_tool_event_lines(
                     progress_event.tool_events,
                     max_length=self.config.live_tool_hint_max_length,
@@ -2842,6 +2824,52 @@ class FeishuChannel(BaseChannel):
             f"{self.config.tool_hint_prefix} {ln}" for ln in lines if ln.strip()
         )
 
+    async def _send_inline_tool_hint(
+        self,
+        msg: OutboundMessage,
+        hint: str,
+        receive_id_type: str,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Inline a tool hint into the active streaming card (or a standalone card).
+
+        Only used when ``hint_mode == "inline"``.  When a streaming card is
+        active for this chat, the hint is appended into the card so the user
+        experience stays cohesive; otherwise a regular interactive card with
+        the same prefix style is sent.
+        """
+        buf = self._stream_bufs.get(self._stream_key(msg.chat_id, msg.metadata))
+        if buf and buf.card_id:
+            # Delegate to send_delta so tool hints get the same
+            # throttling (and card creation) as regular text deltas.
+            await self.send_delta(
+                msg.chat_id,
+                "\n\n" + self._format_tool_hint_delta(hint) + "\n\n",
+                metadata=msg.metadata,
+            )
+            return
+        # No active streaming card — send as a regular interactive card
+        # with the same prefix style. Existing topics stay threaded;
+        # new topics are created only when reply-to-message is enabled.
+        card = json.dumps(
+            {"config": {"wide_screen_mode": True}, "elements": [
+                {"tag": "markdown", "content": self._format_tool_hint_delta(hint)},
+            ]},
+            ensure_ascii=False,
+        )
+        _th_msg_id = self._thread_reply_target(msg.metadata)
+        if _th_msg_id:
+            await loop.run_in_executor(
+                None, lambda: self._reply_message_sync(
+                    _th_msg_id, "interactive", card,
+                    reply_in_thread=self._should_use_reply_in_thread(msg.metadata),
+                ),
+            )
+        else:
+            await loop.run_in_executor(
+                None, self._send_message_sync, receive_id_type, msg.chat_id, "interactive", card
+            )
+
     async def _update_live_hint_card(
         self,
         chat_id: str,
@@ -2858,7 +2886,7 @@ class FeishuChannel(BaseChannel):
         text; *force* bypasses the throttle so the final line of a batch is
         always flushed to the card.
         """
-        if not self.config.live_tool_hint_card:
+        if self.config.hint_mode != "live":
             return
         line = (line or "").strip()
         if not line:
@@ -2894,6 +2922,7 @@ class FeishuChannel(BaseChannel):
                 buf.card_id = card_id
                 buf.sequence = sequence
                 buf.last_edit = now
+                buf.last_heartbeat = now
             else:
                 await loop.run_in_executor(
                     None, self._close_streaming_mode_sync, card_id, sequence + 1
@@ -2908,12 +2937,14 @@ class FeishuChannel(BaseChannel):
             )
             if ok:
                 buf.last_edit = now
+        self._arm_live_hint_heartbeat(chat_id, stream_key)
 
     async def _finalize_live_hint_card(
         self, chat_id: str, metadata: dict[str, Any] | None
     ) -> None:
         """Freeze the live progress card (flush latest line, close streaming)."""
         stream_key = self._stream_key(chat_id, metadata)
+        self._cancel_live_hint_heartbeat(stream_key)
         buf = self._live_hint_bufs.pop(stream_key, None)
         if not buf or not buf.card_id:
             return
@@ -2942,3 +2973,57 @@ class FeishuChannel(BaseChannel):
             await loop.run_in_executor(
                 None, self._close_streaming_mode_sync, buf.card_id, buf.sequence
             )
+
+    def _arm_live_hint_heartbeat(self, chat_id: str, stream_key: str) -> None:
+        """Start (or restart) the pulse refresh for a live hint card.
+
+        The heartbeat re-sends the card's latest line every
+        ``live_tool_hint_heartbeat_seconds`` so a long-running tool without
+        new hint events still feels alive.  A value of ``0`` disables it.
+        """
+        interval = self.config.live_tool_hint_heartbeat_seconds
+        if interval <= 0 or self.config.hint_mode != "live":
+            return
+        self._cancel_live_hint_heartbeat(stream_key)
+        task = asyncio.create_task(
+            self._live_hint_heartbeat_loop(chat_id, stream_key, interval)
+        )
+        self._live_hint_heartbeat_tasks[stream_key] = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._on_background_task_done)
+
+    def _cancel_live_hint_heartbeat(self, stream_key: str) -> None:
+        """Cancel and forget the heartbeat task for *stream_key* (if any)."""
+        task = self._live_hint_heartbeat_tasks.pop(stream_key, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _live_hint_heartbeat_loop(
+        self, chat_id: str, stream_key: str, interval: float
+    ) -> None:
+        """Periodically re-send the live hint card line with a growing pulse."""
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(interval)
+            buf = self._live_hint_bufs.get(stream_key)
+            if buf is None or not buf.card_id or not buf.text:
+                return
+            now = time.monotonic()
+            if buf.last_edit > buf.last_heartbeat:
+                # A real event updated the card after the last tick — reset the
+                # marker rather than re-sending over a fresh line.
+                buf.last_heartbeat = now
+                continue
+            # Re-send the latest line with a subtle growing pulse so the card
+            # visibly progresses even when no new tool hint has arrived.
+            buf.heartbeat_pulse = (buf.heartbeat_pulse + 1) % 4
+            pulse = "\u00b7" * (buf.heartbeat_pulse + 1)
+            ok, buf.sequence = await loop.run_in_executor(
+                None,
+                self._stream_update_text_with_reopen_sync,
+                buf.card_id,
+                f"{buf.text} {pulse}",
+                buf.sequence + 1,
+            )
+            if ok:
+                buf.last_heartbeat = now

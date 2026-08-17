@@ -1,14 +1,16 @@
 # ruff: noqa: E402
 
-"""Tests for the Feishu live progress card (dual tool-hint UX).
+"""Tests for the Feishu live progress card and hint-mode switch.
 
-The inline tool-hint path (append into the active streaming card / standalone
-interactive card) is unchanged; on top of it a dedicated live progress card is
-created on the first tool and each subsequent tool replaces its single line.
+The Feishu channel lets operators pick either inline hints (append into the
+active streaming card / standalone interactive card) or a dedicated live
+progress card — never both at once.  The live card also receives status
+events (token consolidation) and a periodic heartbeat refresh.
 """
+import asyncio
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -90,6 +92,15 @@ def _hint_msg(content: str, tool_events: list[dict] | None, chat_id: str = "oc_c
     )
 
 
+def _status_msg(content: str, chat_id: str = "oc_chat1") -> OutboundMessage:
+    return OutboundMessage(
+        channel="feishu",
+        chat_id=chat_id,
+        content=content,
+        event=ProgressEvent(content=content, tool_hint=True, tool_events=None),
+    )
+
+
 class TestLiveCardCreateReplace:
     @pytest.mark.asyncio
     async def test_first_tool_creates_live_card(self):
@@ -137,8 +148,8 @@ class TestLiveCardCreateReplace:
         ch._client.cardkit.v1.card.create.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_live_card_coexists_with_inline_stream(self):
-        """Inline append into the answer card is untouched while the live card is created."""
+    async def test_live_mode_does_not_append_into_answer_card(self):
+        """Live mode only drives the live card — the answer/stream card is untouched."""
         ch = _make_channel()
         _mock_ok_chain(ch)
         ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
@@ -148,8 +159,8 @@ class TestLiveCardCreateReplace:
         await ch.send(_hint_msg('read docs/api.md', [_tool_event("read_file", {"path": "docs/api.md"})]))
 
         inline = ch._stream_bufs["oc_chat1"]
-        assert "Partial answer" in inline.text
-        assert "read docs/api.md" in inline.text
+        assert inline.text == "Partial answer"  # unchanged
+        assert "read docs/api.md" not in inline.text
         live = ch._live_hint_bufs["oc_chat1"]
         assert live.card_id == "card_live_1"
         assert live.card_id != "card_answer_1"
@@ -214,10 +225,12 @@ class TestLiveCardLifecycle:
         assert "oc_chat1" in ch._live_hint_bufs
 
 
-class TestLiveCardConfig:
+class TestHintMode:
+    """Either-or: inline mode uses inline hints only, live mode uses the live card only."""
+
     @pytest.mark.asyncio
-    async def test_disabled_skips_live_card(self):
-        ch = _make_channel(live_tool_hint_card=False)
+    async def test_inline_mode_skips_live_card(self):
+        ch = _make_channel(hint_mode="inline")
         _mock_ok_chain(ch)
 
         await ch.send(_hint_msg('read docs/api.md', [_tool_event("read_file", {"path": "docs/api.md"})]))
@@ -226,13 +239,107 @@ class TestLiveCardConfig:
         ch._client.cardkit.v1.card.create.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_inline_mode_appends_into_streaming_card(self):
+        ch = _make_channel(hint_mode="inline")
+        _mock_ok_chain(ch)
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="Partial answer", card_id="card_answer_1", sequence=2, last_edit=0.0,
+        )
+
+        await ch.send(_hint_msg('read docs/api.md', [_tool_event("read_file", {"path": "docs/api.md"})]))
+
+        inline = ch._stream_bufs["oc_chat1"]
+        assert "Partial answer" in inline.text
+        assert "read docs/api.md" in inline.text
+        assert "oc_chat1" not in ch._live_hint_bufs
+
+    @pytest.mark.asyncio
+    async def test_inline_mode_sends_standalone_card_with_no_stream(self):
+        ch = _make_channel(hint_mode="inline")
+        _mock_ok_chain(ch)
+
+        await ch.send(_hint_msg('read docs/api.md', [_tool_event("read_file", {"path": "docs/api.md"})]))
+
+        assert "oc_chat1" not in ch._live_hint_bufs
+        assert ch._client.im.v1.message.create.called
+
+    @pytest.mark.asyncio
+    async def test_live_mode_creates_live_card_not_inline(self):
+        ch = _make_channel(hint_mode="live")
+        _mock_ok_chain(ch)
+        ch._stream_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="Partial answer", card_id="card_answer_1", sequence=2, last_edit=0.0,
+        )
+
+        await ch.send(_hint_msg('read docs/api.md', [_tool_event("read_file", {"path": "docs/api.md"})]))
+
+        assert ch._live_hint_bufs["oc_chat1"].card_id == "card_live_1"
+        assert ch._stream_bufs["oc_chat1"].text == "Partial answer"  # inline untouched
+        assert ch._client.im.v1.message.create.not_called
+
+    @pytest.mark.asyncio
+    async def test_status_event_skipped_in_inline_mode(self):
+        """Consolidation status (no tool_events) is only for the live card."""
+        ch = _make_channel(hint_mode="inline")
+        _mock_ok_chain(ch)
+
+        await ch.send(_status_msg("consolidating history (1234/8000 tokens)"))
+
+        assert "oc_chat1" not in ch._live_hint_bufs
+        ch._client.cardkit.v1.card.create.assert_not_called()
+        ch._client.im.v1.message.create.assert_not_called()
+
+
+class TestConsolidationHint:
+    @pytest.mark.asyncio
+    async def test_status_renders_on_live_card(self):
+        ch = _make_channel()
+        _mock_ok_chain(ch)
+
+        await ch.send(_status_msg("consolidating history (1234/8000 tokens)"))
+
+        buf = ch._live_hint_bufs.get("oc_chat1")
+        assert buf is not None
+        assert buf.card_id == "card_live_1"
+        assert "consolidating history" in buf.text
+
+    @pytest.mark.asyncio
+    async def test_completion_status_renders_on_live_card(self):
+        ch = _make_channel()
+        _mock_ok_chain(ch)
+
+        await ch.send(_status_msg("history consolidated"))
+
+        buf = ch._live_hint_bufs.get("oc_chat1")
+        assert buf is not None
+        assert "history consolidated" in buf.text
+
+    @pytest.mark.asyncio
+    async def test_status_skipped_in_inline_mode(self):
+        ch = _make_channel(hint_mode="inline")
+        _mock_ok_chain(ch)
+
+        await ch.send(_status_msg("consolidating history (1234/8000 tokens)"))
+
+        assert "oc_chat1" not in ch._live_hint_bufs
+        ch._client.cardkit.v1.card.create.assert_not_called()
+
+
+class TestLiveCardConfig:
+    @pytest.mark.asyncio
     async def test_camel_case_aliases(self):
-        cfg = FeishuConfig(liveToolHintCard=True, liveToolHintMaxLength=200)
-        assert cfg.live_tool_hint_card is True
+        cfg = FeishuConfig(hintMode="inline", liveToolHintMaxLength=200)
+        assert cfg.hint_mode == "inline"
         assert cfg.live_tool_hint_max_length == 200
         dumped = cfg.model_dump(by_alias=True)
-        assert dumped["liveToolHintCard"] is True
+        assert dumped["hintMode"] == "inline"
         assert dumped["liveToolHintMaxLength"] == 200
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_live_mode(self):
+        cfg = FeishuConfig()
+        assert cfg.hint_mode == "live"
+        assert cfg.live_tool_hint_heartbeat_seconds == 10
 
     @pytest.mark.asyncio
     async def test_live_length_config_formats_longer_lines(self):
@@ -285,3 +392,107 @@ class TestThrottle:
         assert ch._client.cardkit.v1.card_element.content.call_count == before + 1
         update_call = ch._client.cardkit.v1.card_element.content.call_args[0][0]
         assert "hint b" in update_call.body.content
+
+
+class TestHeartbeat:
+    def _run_beat_once(self, ch: FeishuChannel, stream_key: str) -> asyncio.Task:
+        """Run the heartbeat loop in the background, stopping it after one tick."""
+        original = ch._stream_update_text_with_reopen_sync
+
+        first_tick = asyncio.Event()
+        done = asyncio.Event()
+
+        def patched(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if not first_tick.is_set():
+                first_tick.set()
+            return result
+
+        ch._stream_update_text_with_reopen_sync = patched  # type: ignore[method-assign]
+
+        async def _stop_once():
+            await first_tick.wait()
+            await asyncio.sleep(0.01)
+            await ch._finalize_live_hint_card("oc_chat1", {})
+            done.set()
+
+        stop_task = asyncio.create_task(_stop_once())
+        loop_task = asyncio.create_task(
+            ch._live_hint_heartbeat_loop("oc_chat1", stream_key, 0.1)
+        )
+        return loop_task, stop_task, done
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_resends_line_after_idle_interval(self):
+        ch = _make_channel(live_tool_hint_heartbeat_seconds=0.1)
+        _mock_ok_chain(ch)
+        ch._live_hint_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="working…", card_id="card_live_1", sequence=5,
+            last_edit=time.monotonic() - 60, last_heartbeat=time.monotonic() - 60,
+        )
+        loop_task, stop_task, done = self._run_beat_once(ch, "oc_chat1")
+
+        await asyncio.wait_for(done.wait(), timeout=2)
+        loop_task.cancel()
+        stop_task.cancel()
+
+        sent_texts = [
+            call.args[0].body.content
+            for call in ch._client.cardkit.v1.card_element.content.call_args_list
+        ]
+        assert any("working…" in t and "\u00b7" in t for t in sent_texts)  # pulse animated
+
+    @pytest.mark.asyncio
+    async def test_zero_disables_heartbeat(self):
+        ch = _make_channel(live_tool_hint_heartbeat_seconds=0)
+        _mock_ok_chain(ch)
+
+        await ch.send(_hint_msg('read docs/api.md', [_tool_event("read_file", {"path": "docs/api.md"})]))
+
+        assert ch._live_hint_heartbeat_tasks == {}
+        assert ch._background_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_cancelled_on_finalize(self):
+        ch = _make_channel(live_tool_hint_heartbeat_seconds=30)
+        _mock_ok_chain(ch)
+        await ch.send(_hint_msg('read docs/api.md', [_tool_event("read_file", {"path": "docs/api.md"})]))
+        assert "oc_chat1" in ch._live_hint_heartbeat_tasks
+
+        await ch._finalize_live_hint_card("oc_chat1", {})
+
+        assert "oc_chat1" not in ch._live_hint_heartbeat_tasks
+        assert ch._background_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_does_not_clobber_fresh_update(self):
+        ch = _make_channel(live_tool_hint_heartbeat_seconds=0.1)
+        _mock_ok_chain(ch)
+        ch._live_hint_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="old line", card_id="card_live_1", sequence=5,
+            last_edit=time.monotonic(),  # a fresh update just landed
+            last_heartbeat=time.monotonic() - 60,
+        )
+
+        # Run one tick by finalizing after a short wait.
+        async def _run_tick():
+            await asyncio.sleep(0.15)
+            await ch._finalize_live_hint_card("oc_chat1", {})
+
+        stop_task = asyncio.create_task(_run_tick())
+        loop_task = asyncio.create_task(
+            ch._live_hint_heartbeat_loop("oc_chat1", "oc_chat1", 0.1)
+        )
+        await asyncio.wait_for(asyncio.gather(loop_task, stop_task), timeout=2)
+        loop_task.cancel()
+        stop_task.cancel()
+
+        # The fresh update had priority; the loop reset the marker and never
+        # sent a pulse (finalize only flushes the current text).
+        sent_texts = []
+        for call in ch._client.cardkit.v1.card_element.content.call_args_list:
+            body = call.args[0].body.content
+            sent_texts.append(body)
+        assert sent_texts  # finalize flushed the latest line
+        assert all("old line" in t for t in sent_texts)
+        assert all("\u00b7" not in t for t in sent_texts)  # no heartbeat pulse

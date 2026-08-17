@@ -11,7 +11,7 @@ import weakref
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterator
 
 from loguru import logger
 
@@ -753,6 +753,7 @@ class Consolidator:
         get_tool_definitions: Callable[[], list[dict[str, Any]]],
         consolidation_ratio: float = 0.5,
         unified_session: bool = False,
+        on_status: Callable[[str, str], Awaitable[None]] | None = None,
     ):
         self.store = store
         self.sessions = sessions
@@ -760,6 +761,7 @@ class Consolidator:
         self.unified_session = unified_session
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
+        self._on_status = on_status
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
@@ -1031,6 +1033,7 @@ class Consolidator:
                 self._persist_last_summary(session, last_summary)
                 return
 
+            rounds_done = 0
             for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
                 if estimated <= target:
                     break
@@ -1049,6 +1052,12 @@ class Consolidator:
                 chunk = session.messages[session.last_consolidated:end_idx]
                 if not chunk:
                     break
+
+                if self._on_status is not None:
+                    await self._on_status(
+                        session.key,
+                        f"consolidating history ({estimated}/{runtime.context_window_tokens} tokens)",
+                    )
 
                 logger.info(
                     "Token consolidation round {} for {}: {}/{} via {}, chunk={} msgs",
@@ -1070,6 +1079,7 @@ class Consolidator:
                 # would just emit duplicate [RAW] entries.
                 if summary:
                     last_summary = summary
+                    rounds_done += 1
                 session.last_consolidated = end_idx
                 self.sessions.save(session)
                 if not summary:
@@ -1087,6 +1097,9 @@ class Consolidator:
                     estimated, source = 0, "error"
                 if estimated <= 0:
                     break
+
+            if rounds_done and self._on_status is not None:
+                await self._on_status(session.key, "history consolidated")
 
             # Persist the last summary to session metadata so it can be injected
             # into the runtime context on the next prepare_session() call, aligning

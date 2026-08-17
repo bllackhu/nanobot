@@ -23,7 +23,8 @@ class FeishuConfig(Base):
     done_emoji: str | None = None
     listen_emoji: str = "Pin"  # Ack on listen history-only ingest; set "" to disable
     tool_hint_prefix: str = "\U0001f527"
-    live_tool_hint_card: bool = True
+    hint_mode: Literal["inline", "live"] = "live"
+    live_tool_hint_heartbeat_seconds: float = Field(default=10, ge=0)
     live_tool_hint_max_length: int = Field(default=160, ge=40, le=500)
     group_policy: Literal["open", "mention", "listen"] = "mention"
     reply_to_message: bool = False

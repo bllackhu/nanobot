@@ -490,8 +490,9 @@ If QR login is unavailable for your account, use manual setup below.
       "doneEmoji": "DONE",
       "listenEmoji": "Pin",
       "toolHintPrefix": "🔧",
-      "liveToolHintCard": true,
+      "hintMode": "live",
       "liveToolHintMaxLength": 160,
+      "liveToolHintHeartbeatSeconds": 10,
       "streaming": true,
       "domain": "feishu"
     }
@@ -506,9 +507,10 @@ If QR login is unavailable for your account, use manual setup below.
 > `reactEmoji`: Emoji for "processing" status (default: `OnIt`). See [available emojis](https://open.larkoffice.com/document/server-docs/im-v1/message-reaction/emojis-introduce).
 > `doneEmoji`: Optional emoji for "completed" status (e.g., `DONE`, `OK`, `HEART`). When set, bot adds this reaction after removing `reactEmoji`.
 > `listenEmoji`: Emoji on **listen** history-only ingest (unmentioned group messages). Default: `"Pin"`. Set `""` to disable (silent). This reaction is persistent (no stream cleanup). Does not affect @mention turns (those still use `reactEmoji` / `doneEmoji`).
-> `toolHintPrefix`: Prefix for inline tool hints in streaming cards (default: `🔧`).
-> `liveToolHintCard`: When tool hints are enabled (`channels.sendToolHints: true`), show a **live progress card** — a separate message whose single line is replaced on each tool call so users see progress without chat spam. Default: `true`. Set `false` to keep only the inline hints.
+> `toolHintPrefix`: Prefix for tool hints in streaming cards (default: `🔧`). Applies only in `hintMode: "inline"`.
+> `hintMode`: Which tool-hint surface to show when tool hints are enabled: `"inline"` (compact hint appended into the answer streaming card; standalone card when no stream is active) or `"live"` (dedicated **live progress card** — a separate message whose single line is replaced on each tool call so users see progress without chat spam). Default: `"live"`. The two surfaces are mutually exclusive — the old `liveToolHintCard` option was removed and replaced by this switch.
 > `liveToolHintMaxLength`: Max preview length for live progress card lines (default: `160`, range 40–500). Live-card lines are re-formatted from the full tool arguments, so this can be much longer than the compact inline `agents.defaults.toolHintMaxLength`. See [Tool hints](../configuration.md#tool-hints).
+> `liveToolHintHeartbeatSeconds`: How often (seconds) the live card refreshes with a subtle growing pulse (`·`, `··`, …) while a long-running tool produces no new hint (default: `10`; `0` disables). Only applies in `hintMode: "live"`. In `live` mode the card also shows token-consolidation status (`consolidating history (N/M tokens)` → `history consolidated`) while the agent compacts history.
 > `domain`: `"feishu"` (default) for China (open.feishu.cn), `"lark"` for international Lark (open.larksuite.com).
 
 **3. Run**

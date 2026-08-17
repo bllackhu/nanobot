@@ -1,6 +1,9 @@
 """Tests for tool hint formatting (nanobot.utils.tool_hints)."""
 
+import pytest
+
 from nanobot.providers.base import ToolCallRequest
+from nanobot.utils.progress_events import invoke_on_progress_status
 from nanobot.utils.tool_hints import format_tool_event_lines, format_tool_hints
 
 
@@ -370,4 +373,50 @@ class TestFormatToolEventLines:
     def test_malformed_name_skipped(self):
         events = self._events(("", {"path": "x"}))
         assert format_tool_event_lines(events) == []
+
+
+class TestInvokeOnProgressStatus:
+    """invoke_on_progress_status reuses tool_hint=True without tool_events."""
+
+    @pytest.mark.asyncio
+    async def test_passes_content_with_tool_hint_true(self):
+        calls: list[tuple] = []
+
+        async def on_progress(content: str, **kwargs) -> None:
+            calls.append((content, kwargs))
+
+        await invoke_on_progress_status(on_progress, "consolidating history (1/2 tokens)")
+
+        assert len(calls) == 1
+        content, kwargs = calls[0]
+        assert content == "consolidating history (1/2 tokens)"
+        assert kwargs.get("tool_hint") is True
+        assert kwargs.get("tool_events") is None
+
+    @pytest.mark.asyncio
+    async def test_accepts_phase_kwarg_but_still_uses_tool_hint(self):
+        calls: list[tuple] = []
+
+        async def on_progress(content: str, **kwargs) -> None:
+            calls.append((content, kwargs))
+
+        await invoke_on_progress_status(
+            on_progress, "history consolidated", phase="consolidation"
+        )
+
+        assert len(calls) == 1
+        assert calls[0][0] == "history consolidated"
+        assert calls[0][1].get("tool_hint") is True
+
+    @pytest.mark.asyncio
+    async def test_forwards_to_callback_accepting_tool_events_not_required(self):
+        """The helper works even when on_progress lacks a tool_events kwarg."""
+        calls: list[str] = []
+
+        async def on_progress(content: str, tool_hint: bool) -> None:
+            calls.append(content)
+
+        await invoke_on_progress_status(on_progress, "consolidating history")
+
+        assert calls == ["consolidating history"]
 
