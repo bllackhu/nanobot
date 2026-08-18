@@ -14,6 +14,7 @@ from nanobot.utils.progress_events import (
     build_tool_event_finish_payloads,
     build_tool_event_start_payload,
     invoke_on_progress,
+    invoke_on_progress_status,
     on_progress_accepts_tool_events,
 )
 from nanobot.utils.tool_hints import format_tool_hints
@@ -31,6 +32,7 @@ class AgentProgressHook(AgentHook):
         session_key: str | None = None,
         tool_hint_max_length: int = 40,
         on_iteration: Callable[[int], None] | None = None,
+        thinking_hint: str = "AI thinking ...",
     ) -> None:
         super().__init__(reraise=True)
         self._on_progress = on_progress
@@ -39,6 +41,7 @@ class AgentProgressHook(AgentHook):
         self._session_key = session_key
         self._tool_hint_max_length = tool_hint_max_length
         self._on_iteration = on_iteration
+        self._thinking_hint = thinking_hint
         self._stream_buf = ""
         self._think_extractor = IncrementalThinkExtractor()
         self._reasoning_open = False
@@ -91,6 +94,10 @@ class AgentProgressHook(AgentHook):
     async def before_iteration(self, context: AgentHookContext) -> None:
         if self._on_iteration:
             self._on_iteration(context.iteration)
+        if self._on_progress and self._thinking_hint:
+            await invoke_on_progress_status(
+                self._on_progress, self._thinking_hint, phase="thinking"
+            )
         logger.debug(
             "Starting agent loop iteration {} for session {}",
             context.iteration,

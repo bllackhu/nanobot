@@ -471,8 +471,21 @@ class TestToolEventProgress:
         while bus.outbound_size > 0:
             outbound.append(await bus.consume_outbound())
 
-        assert [m.content for m in outbound] == ["Hello"]
-        assert not any(isinstance(m.event, ProgressEvent) for m in outbound)
+        thinking_msgs = [
+            m for m in outbound
+            if isinstance(m.event, ProgressEvent)
+            and m.event.tool_hint
+            and m.event.tool_events is None
+        ]
+        other_progress = [
+            m for m in outbound
+            if isinstance(m.event, ProgressEvent)
+            and not (m.event.tool_hint and m.event.tool_events is None)
+        ]
+        assert len(thinking_msgs) == 1
+        assert thinking_msgs[0].content == "AI thinking ..."
+        assert other_progress == []
+        assert [m.content for m in outbound if not isinstance(m.event, ProgressEvent)] == ["Hello"]
         assert not any(isinstance(m.event, StreamedResponseEvent) for m in outbound)
         provider.chat_stream_with_retry.assert_not_awaited()
         provider.chat_with_retry.assert_awaited_once()
@@ -639,7 +652,11 @@ class TestToolEventProgress:
 
         assert final_content == "Done"
         assert streamed == ["I will", " inspect it."]
-        assert progress[0][0] == 'custom_tool("foo.txt")'
+        assert progress[0][0] == "AI thinking ..."
+        assert progress[0][1] is True
+        assert progress[0][2] is None
+        tool_hints = [item for item in progress if item[0] == 'custom_tool("foo.txt")']
+        assert tool_hints, "expected a tool hint for the executed tool"
         assert all(item[0] != "I will inspect it." for item in progress)
 
     @pytest.mark.asyncio
@@ -884,9 +901,26 @@ class TestToolEventProgress:
         while bus.outbound_size > 0:
             outbound.append(await bus.consume_outbound())
 
-        assert len(outbound) == 1
-        assert outbound[0].content == "Done"
-        assert not isinstance(outbound[0].event, TurnEndEvent)
+        non_status = [
+            m for m in outbound
+            if not (
+                isinstance(m.event, ProgressEvent)
+                and m.event.tool_hint
+                and m.event.tool_events is None
+            )
+        ]
+        assert len(non_status) == 1
+        assert non_status[0].content == "Done"
+        assert not isinstance(non_status[0].event, TurnEndEvent)
+
+        thinking_msgs = [
+            m for m in outbound
+            if isinstance(m.event, ProgressEvent)
+            and m.event.tool_hint
+            and m.event.tool_events is None
+        ]
+        assert len(thinking_msgs) == 1
+        assert thinking_msgs[0].content == "AI thinking ..."
 
 
 class TestConsolidationStatusWiring:

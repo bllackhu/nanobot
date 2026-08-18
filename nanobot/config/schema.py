@@ -142,6 +142,11 @@ class AgentDefaults(Base):
         validation_alias=AliasChoices("toolHintMaxLength"),
         serialization_alias="toolHintMaxLength",
     )  # Max characters for tool hint display (e.g. "$ cd …/project && npm test")
+    thinking_hint: str = Field(
+        default="AI thinking ...",
+        validation_alias=AliasChoices("thinkingHint"),
+        serialization_alias="thinkingHint",
+    )  # Status message shown while the agent waits on the model (e.g. live Feishu card)
     reasoning_effort: str | None = None  # low / medium / high / adaptive / none — LLM thinking effort; None preserves the provider default
     timezone: str = "UTC"  # IANA timezone, e.g. "Asia/Shanghai", "America/New_York"
     bot_name: str = "nanobot"  # Display name shown in CLI prompts (e.g. "{name} is thinking...")

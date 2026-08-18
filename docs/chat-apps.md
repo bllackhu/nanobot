@@ -493,6 +493,8 @@ If QR login is unavailable for your account, use manual setup below.
       "hintMode": "live",
       "liveToolHintMaxLength": 160,
       "liveToolHintHeartbeatSeconds": 10,
+      "liveToolHintProcessingNote": "processing",
+      "liveToolHintDoneNote": "done",
       "streaming": true,
       "domain": "feishu"
     }
@@ -510,7 +512,9 @@ If QR login is unavailable for your account, use manual setup below.
 > `toolHintPrefix`: Prefix for tool hints in streaming cards (default: `🔧`). Applies only in `hintMode: "inline"`.
 > `hintMode`: Which tool-hint surface to show when tool hints are enabled: `"inline"` (compact hint appended into the answer streaming card; standalone card when no stream is active) or `"live"` (dedicated **live progress card** — a separate message whose single line is replaced on each tool call so users see progress without chat spam). Default: `"live"`. The two surfaces are mutually exclusive — the old `liveToolHintCard` option was removed and replaced by this switch.
 > `liveToolHintMaxLength`: Max preview length for live progress card lines (default: `160`, range 40–500). Live-card lines are re-formatted from the full tool arguments, so this can be much longer than the compact inline `agents.defaults.toolHintMaxLength`. See [Tool hints](../configuration.md#tool-hints).
-> `liveToolHintHeartbeatSeconds`: How often (seconds) the live card refreshes with a subtle growing pulse (`·`, `··`, …) while a long-running tool produces no new hint (default: `10`; `0` disables). Only applies in `hintMode: "live"`. In `live` mode the card also shows token-consolidation status (`consolidating history (N/M tokens)` → `history consolidated`) while the agent compacts history.
+> `liveToolHintHeartbeatSeconds`: How often (seconds) the live card refreshes with a subtle growing pulse (`·`, `··`, …) while a long-running tool produces no new hint (default: `10`; `0` disables). Only applies in `hintMode: "live"`. In `live` mode the card also shows status lines while the agent waits: an `AI thinking ...` line while the LLM call is pending (animated by the heartbeat), and token-consolidation status (`consolidating history (N/M tokens)` → `history consolidated`) while the agent compacts history. The text comes from `agents.defaults.thinkingHint` (set `""` to disable the thinking line).
+> `liveToolHintProcessingNote`: Trailing note appended to each live tool-hint line (e.g. `🔧 read docs/api.md - processing`, default: `"processing"`). Set `""` to disable. Only applies in `hintMode: "live"`; status lines (`AI thinking ...`, consolidation) are unaffected.
+> `liveToolHintDoneNote`: Replaces the processing note when the live card finalizes at the end of a turn (e.g. `🔧 read docs/api.md - done`, default: `"done"`). Only applies in `hintMode: "live"`.
 > `domain`: `"feishu"` (default) for China (open.feishu.cn), `"lark"` for international Lark (open.larksuite.com).
 
 **3. Run**

@@ -263,6 +263,7 @@ class AgentLoop:
         fail_on_tool_error: bool | None = None,
         provider_retry_mode: str = "standard",
         tool_hint_max_length: int | None = None,
+        thinking_hint: str | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
@@ -330,6 +331,9 @@ class AgentLoop:
         self.tool_hint_max_length = (
             tool_hint_max_length if tool_hint_max_length is not None
             else defaults.tool_hint_max_length
+        )
+        self.thinking_hint = (
+            thinking_hint if thinking_hint is not None else defaults.thinking_hint
         )
         self.tools_config = _tc
         self.web_config = _tc.web
@@ -470,6 +474,7 @@ class AgentLoop:
             fail_on_tool_error=defaults.fail_on_tool_error,
             provider_retry_mode=defaults.provider_retry_mode,
             tool_hint_max_length=defaults.tool_hint_max_length,
+            thinking_hint=defaults.thinking_hint,
             restrict_to_workspace=config.tools.restrict_to_workspace,
             mcp_servers=config.tools.mcp_servers,
             channels_config=config.channels,
@@ -920,6 +925,7 @@ class AgentLoop:
                 session_key=active_session_key,
                 workspace=effective_scope.project_path,
                 tool_hint_max_length=self.tool_hint_max_length,
+                thinking_hint=self.thinking_hint,
                 on_iteration=lambda iteration: setattr(self, "_current_iteration", iteration),
                 registered_hook_factories=self._hook_factories,
                 turn_hook_factories=list(hook_factories or []),

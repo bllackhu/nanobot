@@ -2188,12 +2188,13 @@ Set `agents.defaults.toolHintMaxLength` to control the truncation threshold:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `agents.defaults.toolHintMaxLength` | `40` | Maximum characters for tool hint display. Range: 20–500. Higher values show more of the command or path; lower values keep hints compact. |
+| `agents.defaults.thinkingHint` | `"AI thinking ..."` | Status text emitted on the live progress card while the agent waits on the LLM. Set to `""` to disable. Only shown in `hintMode: "live"`; no processing note is appended. |
 
 ## Feishu Tool-Hint Mode
 
 When Feishu tool hints are enabled (`channels.sendToolHints: true`), the Feishu channel shows tool activity on exactly **one** surface, controlled by `channels.feishu.hintMode`:
 
-1. **`"live"` (default)** — a separate CardKit **live progress card** whose single line is **replaced** on each tool call (latest overrides previous), so users see progress without chat spam. It also shows token-consolidation status while the agent is compacting history. The card is finalized (streaming closed) when the turn ends and is never deleted.
+1. **`"live"` (default)** — a separate CardKit **live progress card** whose single line is **replaced** on each tool call (latest overrides previous), so users see progress without chat spam. Each tool-hint line carries a trailing note (`🔧 read docs/api.md - processing`); when the turn ends the card is finalized (streaming closed) and the note flips to `- done`. It also shows token-consolidation status while the agent is compacting history, and an `AI thinking ...` status line while the agent is waiting on the LLM (both status lines keep their own text and do not get the processing note). The card is finalized when the turn ends and is never deleted.
 2. **`"inline"`** — the compact batched hint appended into the answer streaming card (or sent as a standalone interactive card when no stream is active), truncated by `agents.defaults.toolHintMaxLength`. No live card is created.
 
 The live card re-formats each tool from its full arguments, so it can show longer step detail than the compact inline line. Because the two surfaces are mutually exclusive, operators choose one or the other — they never render at the same time.
@@ -2205,7 +2206,9 @@ The live card re-formats each tool from its full arguments, so it can show longe
     "feishu": {
       "hintMode": "live",
       "liveToolHintMaxLength": 200,
-      "liveToolHintHeartbeatSeconds": 10
+      "liveToolHintHeartbeatSeconds": 10,
+      "liveToolHintProcessingNote": "processing",
+      "liveToolHintDoneNote": "done"
     }
   }
 }
@@ -2216,5 +2219,7 @@ The live card re-formats each tool from its full arguments, so it can show longe
 | `channels.feishu.hintMode` | `"live"` | Which tool-hint surface to show: `"inline"` (compact hint in the answer card) or `"live"` (dedicated live progress card). They are mutually exclusive — `liveToolHintCard` was removed in favor of this switch. |
 | `channels.feishu.liveToolHintMaxLength` | `160` | Max characters for live progress card lines. Range: 40–500. Live lines are formatted from raw tool arguments, so this can exceed the inline `agents.defaults.toolHintMaxLength`. |
 | `channels.feishu.liveToolHintHeartbeatSeconds` | `10` | How often (seconds) the live card refreshes with a subtle growing pulse (`·`, `··`, …) while a long-running tool produces no new hint. `0` disables the heartbeat. Only applies in `hintMode: "live"`. |
+| `channels.feishu.liveToolHintProcessingNote` | `"processing"` | Trailing note appended to each live tool-hint line (e.g. `🔧 read docs/api.md - processing`). Set to `""` to disable. Only applies in `hintMode: "live"`; status lines (consolidation) are unaffected. |
+| `channels.feishu.liveToolHintDoneNote` | `"done"` | Replaces the processing note when the live card is finalized at the end of a turn (e.g. `🔧 read docs/api.md - done`). Only applies in `hintMode: "live"`. |
 
-In `live` mode the card also shows **consolidation status**: while the agent runs token-consolidation it emits `consolidating history (N/M tokens)` and a final `history consolidated` line on the live card. In `inline` mode these status lines are skipped (they only make sense on the live card).
+In `live` mode the card also shows **status lines**: while the agent waits on the model it emits `AI thinking ...`, and during token-consolidation it emits `consolidating history (N/M tokens)` with a final `history consolidated` line. The heartbeat animates any of these lines during long waits. In `inline` mode these status lines are skipped (they only make sense on the live card).

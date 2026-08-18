@@ -2400,6 +2400,7 @@ class FeishuChannel(BaseChannel):
                     return
                 # Live mode: drive the dedicated live progress card only —
                 # one line per tool, latest line replaces the previous.
+                has_tool_events = bool(progress_event.tool_events)
                 lines = format_tool_event_lines(
                     progress_event.tool_events,
                     max_length=self.config.live_tool_hint_max_length,
@@ -2407,10 +2408,13 @@ class FeishuChannel(BaseChannel):
                 if not lines:
                     lines = [ln for ln in self.__class__._format_tool_hint_lines(hint).split("\n") if ln.strip()]
                 for idx, line in enumerate(lines):
+                    rendered = f"{self.config.tool_hint_prefix} {line}"
+                    if has_tool_events:
+                        rendered = self._render_live_hint_line(rendered)
                     await self._update_live_hint_card(
                         msg.chat_id,
                         msg.metadata,
-                        f"{self.config.tool_hint_prefix} {line}",
+                        rendered,
                         force=(idx == len(lines) - 1),
                     )
                 return
@@ -2870,6 +2874,21 @@ class FeishuChannel(BaseChannel):
                 None, self._send_message_sync, receive_id_type, msg.chat_id, "interactive", card
             )
 
+    def _render_live_hint_line(self, line: str) -> str:
+        """Tool line with the configurable trailing note, e.g. '🔧 read docs/api.md - processing'."""
+        note = (self.config.live_tool_hint_processing_note or "").strip()
+        suffix = f" - {note}" if note else ""
+        return f"{line}{suffix}"
+
+    @staticmethod
+    def _swap_live_note_to_done(text: str, *, processing_note: str, done_note: str) -> str:
+        """Replace a trailing processing note with the done note (no-op if absent)."""
+        note = (processing_note or "").strip()
+        done = (done_note or "").strip()
+        if note and done and text.endswith(f" - {note}"):
+            return f"{text[: -len(f' - {note}')]} - {done}"
+        return text
+
     async def _update_live_hint_card(
         self,
         chat_id: str,
@@ -2950,6 +2969,11 @@ class FeishuChannel(BaseChannel):
             return
         loop = asyncio.get_running_loop()
         if buf.text:
+            buf.text = self._swap_live_note_to_done(
+                buf.text,
+                processing_note=self.config.live_tool_hint_processing_note,
+                done_note=self.config.live_tool_hint_done_note,
+            )
             buf.sequence += 1
             ok, buf.sequence = await loop.run_in_executor(
                 None,

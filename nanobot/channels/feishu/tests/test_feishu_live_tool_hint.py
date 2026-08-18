@@ -325,6 +325,167 @@ class TestConsolidationHint:
         ch._client.cardkit.v1.card.create.assert_not_called()
 
 
+class TestThinkingHint:
+    """The 'AI thinking ...' status hint renders on the live card like consolidation."""
+
+    @pytest.mark.asyncio
+    async def test_thinking_status_renders_on_live_card(self):
+        ch = _make_channel()
+        _mock_ok_chain(ch)
+
+        await ch.send(_status_msg("AI thinking ..."))
+
+        buf = ch._live_hint_bufs.get("oc_chat1")
+        assert buf is not None
+        assert "AI thinking ..." in buf.text
+
+    @pytest.mark.asyncio
+    async def test_thinking_status_does_not_get_processing_note(self):
+        """The thinking hint is a status event — no trailing ' - processing' note."""
+        ch = _make_channel()
+        _mock_ok_chain(ch)
+
+        await ch.send(_status_msg("AI thinking ..."))
+
+        buf = ch._live_hint_bufs.get("oc_chat1")
+        assert buf is not None
+        assert "AI thinking ..." in buf.text
+        assert not buf.text.endswith(" - processing")
+
+    @pytest.mark.asyncio
+    async def test_thinking_status_replaced_by_next_tool_hint(self):
+        """The live card swaps from the thinking line to the next tool line."""
+        ch = _make_channel()
+        _mock_ok_chain(ch)
+
+        await ch.send(_status_msg("AI thinking ..."))
+        await ch.send(_hint_msg('read docs/api.md', [_tool_event("read_file", {"path": "docs/api.md"})]))
+
+        buf = ch._live_hint_bufs.get("oc_chat1")
+        assert buf is not None
+        assert 'read docs/api.md' in buf.text
+        assert "AI thinking ..." not in buf.text
+
+    @pytest.mark.asyncio
+    async def test_thinking_status_skipped_in_inline_mode(self):
+        ch = _make_channel(hint_mode="inline")
+        _mock_ok_chain(ch)
+
+        await ch.send(_status_msg("AI thinking ..."))
+
+        assert "oc_chat1" not in ch._live_hint_bufs
+        ch._client.cardkit.v1.card.create.assert_not_called()
+        ch._client.im.v1.message.create.assert_not_called()
+
+
+class TestLiveCardProcessingNote:
+    """Configurable trailing note on live tool-hint lines; swapped to 'done' on finalize."""
+
+    @pytest.mark.asyncio
+    async def test_tool_hint_renders_with_default_note(self):
+        ch = _make_channel()
+        _mock_ok_chain(ch)
+
+        await ch.send(_hint_msg('read docs/api.md', [_tool_event("read_file", {"path": "docs/api.md"})]))
+
+        buf = ch._live_hint_bufs.get("oc_chat1")
+        assert buf is not None
+        assert buf.text.endswith(" - processing")
+
+    @pytest.mark.asyncio
+    async def test_empty_note_disables_suffix(self):
+        ch = _make_channel(live_tool_hint_processing_note="")
+        _mock_ok_chain(ch)
+
+        await ch.send(_hint_msg('read docs/api.md', [_tool_event("read_file", {"path": "docs/api.md"})]))
+
+        buf = ch._live_hint_bufs.get("oc_chat1")
+        assert buf is not None
+        assert not buf.text.endswith(" - ")
+
+    @pytest.mark.asyncio
+    async def test_custom_note_text(self):
+        ch = _make_channel(live_tool_hint_processing_note="working")
+        _mock_ok_chain(ch)
+
+        await ch.send(_hint_msg('read docs/api.md', [_tool_event("read_file", {"path": "docs/api.md"})]))
+
+        buf = ch._live_hint_bufs.get("oc_chat1")
+        assert buf is not None
+        assert buf.text.endswith(" - working")
+
+    @pytest.mark.asyncio
+    async def test_status_events_do_not_get_note(self):
+        """Consolidation status keeps its own text — no trailing processing note."""
+        ch = _make_channel()
+        _mock_ok_chain(ch)
+
+        await ch.send(_status_msg("consolidating history (1234/8000 tokens)"))
+
+        buf = ch._live_hint_bufs.get("oc_chat1")
+        assert buf is not None
+        assert "consolidating history" in buf.text
+        assert not buf.text.endswith(" - processing")
+
+    @pytest.mark.asyncio
+    async def test_finalize_swaps_note_to_done(self):
+        ch = _make_channel()
+        _mock_ok_chain(ch)
+        await ch.send(_hint_msg('read docs/api.md', [_tool_event("read_file", {"path": "docs/api.md"})]))
+        assert ch._live_hint_bufs["oc_chat1"].text.endswith(" - processing")
+
+        await ch._finalize_live_hint_card("oc_chat1", {})
+
+        assert "oc_chat1" not in ch._live_hint_bufs
+        sent_texts = [
+            call.args[0].body.content
+            for call in ch._client.cardkit.v1.card_element.content.call_args_list
+        ]
+        # The final flush updated the card with the done note in place of processing.
+        assert any(
+            t.endswith(" - done") and " - processing" not in t for t in sent_texts
+        )
+
+    @pytest.mark.asyncio
+    async def test_finalize_uses_custom_done_note(self):
+        ch = _make_channel(live_tool_hint_processing_note="working", live_tool_hint_done_note="finished")
+        _mock_ok_chain(ch)
+        await ch.send(_hint_msg('read docs/api.md', [_tool_event("read_file", {"path": "docs/api.md"})]))
+        assert ch._live_hint_bufs["oc_chat1"].text.endswith(" - working")
+
+        await ch._finalize_live_hint_card("oc_chat1", {})
+
+        sent_texts = [
+            call.args[0].body.content
+            for call in ch._client.cardkit.v1.card_element.content.call_args_list
+        ]
+        assert any(t.endswith(" - finished") and " - working" not in t for t in sent_texts)
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_keeps_note_then_done(self):
+        ch = _make_channel(live_tool_hint_heartbeat_seconds=0.1)
+        _mock_ok_chain(ch)
+        ch._live_hint_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="🔧 read docs/api.md - processing", card_id="card_live_1", sequence=5,
+            last_edit=time.monotonic() - 60, last_heartbeat=time.monotonic() - 60,
+        )
+
+        loop_task, stop_task, done = _run_beat_once(ch, "oc_chat1")
+
+        await asyncio.wait_for(done.wait(), timeout=2)
+        loop_task.cancel()
+        stop_task.cancel()
+
+        sent_texts = [
+            call.args[0].body.content
+            for call in ch._client.cardkit.v1.card_element.content.call_args_list
+        ]
+        # During the turn the heartbeat pulse rides along with the note.
+        assert any("processing" in t and "\u00b7" in t for t in sent_texts)
+        # After finalize the note is swapped to done.
+        assert any(t.endswith(" - done") for t in sent_texts)
+
+
 class TestLiveCardConfig:
     @pytest.mark.asyncio
     async def test_camel_case_aliases(self):
@@ -336,10 +497,24 @@ class TestLiveCardConfig:
         assert dumped["liveToolHintMaxLength"] == 200
 
     @pytest.mark.asyncio
+    async def test_note_config_camel_case_aliases(self):
+        cfg = FeishuConfig(
+            liveToolHintProcessingNote="working",
+            liveToolHintDoneNote="finished",
+        )
+        assert cfg.live_tool_hint_processing_note == "working"
+        assert cfg.live_tool_hint_done_note == "finished"
+        dumped = cfg.model_dump(by_alias=True)
+        assert dumped["liveToolHintProcessingNote"] == "working"
+        assert dumped["liveToolHintDoneNote"] == "finished"
+
+    @pytest.mark.asyncio
     async def test_defaults_to_live_mode(self):
         cfg = FeishuConfig()
         assert cfg.hint_mode == "live"
         assert cfg.live_tool_hint_heartbeat_seconds == 10
+        assert cfg.live_tool_hint_processing_note == "processing"
+        assert cfg.live_tool_hint_done_note == "done"
 
     @pytest.mark.asyncio
     async def test_live_length_config_formats_longer_lines(self):
@@ -394,33 +569,35 @@ class TestThrottle:
         assert "hint b" in update_call.body.content
 
 
+def _run_beat_once(ch: FeishuChannel, stream_key: str) -> tuple[asyncio.Task, asyncio.Task, asyncio.Event]:
+    """Run the heartbeat loop in the background, stopping it after one tick."""
+    original = ch._stream_update_text_with_reopen_sync
+
+    first_tick = asyncio.Event()
+    done = asyncio.Event()
+
+    def patched(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if not first_tick.is_set():
+            first_tick.set()
+        return result
+
+    ch._stream_update_text_with_reopen_sync = patched  # type: ignore[method-assign]
+
+    async def _stop_once():
+        await first_tick.wait()
+        await asyncio.sleep(0.01)
+        await ch._finalize_live_hint_card("oc_chat1", {})
+        done.set()
+
+    stop_task = asyncio.create_task(_stop_once())
+    loop_task = asyncio.create_task(
+        ch._live_hint_heartbeat_loop("oc_chat1", stream_key, 0.1)
+    )
+    return loop_task, stop_task, done
+
+
 class TestHeartbeat:
-    def _run_beat_once(self, ch: FeishuChannel, stream_key: str) -> asyncio.Task:
-        """Run the heartbeat loop in the background, stopping it after one tick."""
-        original = ch._stream_update_text_with_reopen_sync
-
-        first_tick = asyncio.Event()
-        done = asyncio.Event()
-
-        def patched(*args, **kwargs):
-            result = original(*args, **kwargs)
-            if not first_tick.is_set():
-                first_tick.set()
-            return result
-
-        ch._stream_update_text_with_reopen_sync = patched  # type: ignore[method-assign]
-
-        async def _stop_once():
-            await first_tick.wait()
-            await asyncio.sleep(0.01)
-            await ch._finalize_live_hint_card("oc_chat1", {})
-            done.set()
-
-        stop_task = asyncio.create_task(_stop_once())
-        loop_task = asyncio.create_task(
-            ch._live_hint_heartbeat_loop("oc_chat1", stream_key, 0.1)
-        )
-        return loop_task, stop_task, done
 
     @pytest.mark.asyncio
     async def test_heartbeat_resends_line_after_idle_interval(self):
@@ -430,7 +607,7 @@ class TestHeartbeat:
             text="working…", card_id="card_live_1", sequence=5,
             last_edit=time.monotonic() - 60, last_heartbeat=time.monotonic() - 60,
         )
-        loop_task, stop_task, done = self._run_beat_once(ch, "oc_chat1")
+        loop_task, stop_task, done = _run_beat_once(ch, "oc_chat1")
 
         await asyncio.wait_for(done.wait(), timeout=2)
         loop_task.cancel()

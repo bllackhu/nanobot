@@ -26,6 +26,8 @@ class FeishuConfig(Base):
     hint_mode: Literal["inline", "live"] = "live"
     live_tool_hint_heartbeat_seconds: float = Field(default=10, ge=0)
     live_tool_hint_max_length: int = Field(default=160, ge=40, le=500)
+    live_tool_hint_processing_note: str = "processing"
+    live_tool_hint_done_note: str = "done"
     group_policy: Literal["open", "mention", "listen"] = "mention"
     reply_to_message: bool = False
     streaming: bool = True
