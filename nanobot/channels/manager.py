@@ -691,7 +691,14 @@ class ChannelManager:
                     if not progress_event.tool_hint and not self._should_send_progress(
                         msg.channel, tool_hint=False,
                     ):
-                        continue
+                        # Finish payloads use tool_hint=False. Still deliver them
+                        # when the channel opted into tool hints so live-card
+                        # UIs can close an in-flight tool line.
+                        if not (
+                            progress_event.tool_events
+                            and self._should_send_progress(msg.channel, tool_hint=True)
+                        ):
+                            continue
 
                 if isinstance(event, RetryWaitEvent):
                     continue
@@ -794,7 +801,9 @@ class ChannelManager:
             await ChannelManager._send_stream_event(channel, msg, event)
         elif isinstance(event, StreamEndEvent):
             await ChannelManager._send_stream_event(channel, msg, event)
-        elif not isinstance(event, StreamedResponseEvent):
+        else:
+            # Includes StreamedResponseEvent (channels may finalize mid-turn UI)
+            # and ordinary chat messages.
             await channel.send(msg)
 
     def _coalesce_stream_deltas(

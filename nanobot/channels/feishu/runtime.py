@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import math
 import os
 import re
 import threading
@@ -12,7 +13,7 @@ import time
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -23,7 +24,11 @@ from rich.panel import Panel
 from rich.text import Text
 
 from nanobot.bus.events import INBOUND_META_HISTORY_ONLY, OutboundMessage
-from nanobot.bus.outbound_events import ProgressEvent
+from nanobot.bus.outbound_events import (
+    ProgressEvent,
+    StreamedResponseEvent,
+    outbound_event_from_message,
+)
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.contracts import ChannelInstanceSpec
@@ -876,10 +881,19 @@ class _FeishuStreamBuf:
 
     text: str = ""
     card_id: str | None = None
+    message_id: str | None = None  # chat message id (om_…) when the live card was sent
     sequence: int = 0
     last_edit: float = 0.0
     last_heartbeat: float = 0.0
+    last_line_write: float = 0.0
+    last_payload: str = ""
     heartbeat_pulse: int = 0
+    thinking_status: bool = False
+    tool_in_flight: bool = False
+    done_hold_until: float = 0.0
+    elapsed_started_at: float = 0.0
+    post_turn_consolidation: bool = False
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class FeishuChannel(BaseChannel):
@@ -898,6 +912,10 @@ class FeishuChannel(BaseChannel):
     display_name = "Feishu"
 
     _STREAM_EDIT_INTERVAL = 0.5  # throttle between CardKit streaming updates
+    # Markdown bodies that are exactly one of these chars do not typewrite well.
+    _LIVE_STREAM_UNSAFE_SEEDS = frozenset("-*+#>`|")
+    _FEISHU_DEFAULT_PRINT_FREQUENCY_MS = 70
+    _FEISHU_DEFAULT_PRINT_STEP = 1
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
@@ -931,6 +949,7 @@ class FeishuChannel(BaseChannel):
         self._stream_bufs: dict[str, _FeishuStreamBuf] = {}
         self._live_hint_bufs: dict[str, _FeishuStreamBuf] = {}
         self._live_hint_heartbeat_tasks: dict[str, asyncio.Task] = {}
+        self._live_hint_finalized: set[str] = set()
         self._bot_open_id: str | None = None
         self._background_tasks: set[asyncio.Task] = set()
         self._reaction_ids: dict[str, str] = {}  # message_id → reaction_id
@@ -1107,6 +1126,7 @@ class FeishuChannel(BaseChannel):
         for stream_key in list(self._live_hint_heartbeat_tasks):
             self._cancel_live_hint_heartbeat(stream_key)
         self._live_hint_bufs.clear()
+        self._live_hint_finalized.clear()
         await self._ws_runner.stop_client(self.name)
         self.logger.info("bot stopped")
 
@@ -1873,6 +1893,19 @@ class FeishuChannel(BaseChannel):
             reply_in_thread: If True, reply as a thread/topic message
                 in the Feishu client.
         """
+        return self._reply_message_id_sync(
+            parent_message_id, msg_type, content, reply_in_thread=reply_in_thread,
+        ) is not None
+
+    def _reply_message_id_sync(
+        self,
+        parent_message_id: str,
+        msg_type: str,
+        content: str,
+        *,
+        reply_in_thread: bool = False,
+    ) -> str | None:
+        """Reply and return the new message_id (empty string if Feishu omits it)."""
         from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
 
         try:
@@ -1895,23 +1928,25 @@ class FeishuChannel(BaseChannel):
                     response.get_log_id(),
                 )
                 if msg_type == "interactive":
-                    return self._reply_interactive_fallback_sync(
+                    ok = self._reply_interactive_fallback_sync(
                         parent_message_id,
                         content,
                         reply_in_thread=reply_in_thread,
                     )
-                return False
+                    return "" if ok else None
+                return None
             self.logger.debug("reply sent to message {}", parent_message_id)
-            return True
+            return getattr(response.data, "message_id", None) or ""
         except Exception:
             self.logger.exception("Error replying to message {}", parent_message_id)
             if msg_type == "interactive":
-                return self._reply_interactive_fallback_sync(
+                ok = self._reply_interactive_fallback_sync(
                     parent_message_id,
                     content,
                     reply_in_thread=reply_in_thread,
                 )
-            return False
+                return "" if ok else None
+            return None
 
     @staticmethod
     def _interactive_content_to_text(content: str) -> str | None:
@@ -2047,8 +2082,11 @@ class FeishuChannel(BaseChannel):
         reply_message_id: str | None = None,
         *,
         reply_in_thread: bool = False,
-    ) -> str | None:
-        """Create a CardKit streaming card, send it to chat, return card_id.
+    ) -> tuple[str, str | None] | None:
+        """Create a CardKit streaming card, send it to chat.
+
+        Returns ``(card_id, chat_message_id)`` on success. *chat_message_id*
+        may be ``None`` when Feishu does not return one (e.g. reply fallback).
 
         When *reply_message_id* is provided the card is delivered via the
         reply API. *reply_in_thread* controls whether Feishu creates a
@@ -2057,9 +2095,29 @@ class FeishuChannel(BaseChannel):
         """
         from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
 
+        config: dict[str, object] = {
+            "wide_screen_mode": True,
+            "update_multi": True,
+            "streaming_mode": True,
+        }
+        # Feishu renders the typewriter per card via streaming_config. It must
+        # be set at creation and stay constant for the card's lifetime, so we
+        # only set it here. Omit it entirely when every knob is unset so the
+        # Feishu 70ms/1-char default applies on all clients.
+        streaming_config: dict[str, object] = {}
+        if self.config.live_tool_hint_print_frequency_ms is not None:
+            streaming_config["print_frequency_ms"] = {
+                "default": self.config.live_tool_hint_print_frequency_ms,
+            }
+        if self.config.live_tool_hint_print_step is not None:
+            streaming_config["print_step"] = {"default": self.config.live_tool_hint_print_step}
+        if streaming_config:
+            streaming_config["print_strategy"] = self.config.live_tool_hint_print_strategy
+            config["streaming_config"] = streaming_config
+
         card_json = {
             "schema": "2.0",
-            "config": {"wide_screen_mode": True, "update_multi": True, "streaming_mode": True},
+            "config": config,
             "body": {
                 "elements": [{"tag": "markdown", "content": "", "element_id": _STREAM_ELEMENT_ID}]
             },
@@ -2087,16 +2145,18 @@ class FeishuChannel(BaseChannel):
                     {"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False
                 )
                 if reply_message_id:
-                    sent = self._reply_message_sync(
+                    sent_id = self._reply_message_id_sync(
                         reply_message_id, "interactive", card_content,
                         reply_in_thread=reply_in_thread,
                     )
+                    if sent_id is not None:
+                        return card_id, (sent_id or None)
                 else:
-                    sent = self._send_message_sync(
+                    sent_id = self._send_message_sync(
                         receive_id_type, chat_id, "interactive", card_content,
-                    ) is not None
-                if sent:
-                    return card_id
+                    )
+                    if sent_id:
+                        return card_id, sent_id
                 self.logger.warning(
                     "Created streaming card {} but failed to send it to {}", card_id, chat_id
                 )
@@ -2326,7 +2386,7 @@ class FeishuChannel(BaseChannel):
             # when reply-to-message is enabled.
             use_reply_in_thread = self._should_use_reply_in_thread(meta)
             reply_msg_id = self._thread_reply_target(meta)
-            card_id = await loop.run_in_executor(
+            card_created = await loop.run_in_executor(
                 None,
                 lambda: self._create_streaming_card_sync(
                     rid_type,
@@ -2335,12 +2395,14 @@ class FeishuChannel(BaseChannel):
                     reply_in_thread=use_reply_in_thread,
                 ),
             )
-            if card_id:
+            if card_created:
+                card_id, _msg_id = card_created
                 ok, sequence = await loop.run_in_executor(
                     None, self._stream_update_text_with_reopen_sync, card_id, buf.text, 1
                 )
                 if ok:
                     buf.card_id = card_id
+                    buf.message_id = _msg_id
                     buf.sequence = sequence
                     buf.last_edit = now
                 else:
@@ -2380,44 +2442,92 @@ class FeishuChannel(BaseChannel):
             # Handle tool hint messages.  When a streaming card is active for
             # this chat, inline the hint into the card instead of sending a
             # separate message so the user experience stays cohesive.
-            progress_event = msg.event if isinstance(msg.event, ProgressEvent) else None
+            event = outbound_event_from_message(msg)
+            if isinstance(event, StreamedResponseEvent):
+                # Answer already delivered via stream_end; only freeze the live card.
+                await self._finalize_live_hint_card(msg.chat_id, msg.metadata)
+                return
+
+            progress_event = event if isinstance(event, ProgressEvent) else None
 
             if progress_event is None:
                 # A plain (final) message has no progress semantics — freeze any
                 # live progress card so its last line stays visible.
                 await self._finalize_live_hint_card(msg.chat_id, msg.metadata)
 
-            if progress_event and progress_event.tool_hint:
-                hint = (msg.content or "").strip()
-                if not hint:
+            if progress_event:
+                if self._live_tool_events_are_finish(progress_event.tool_events):
+                    # Batch finished: swap processing → done. Do not fall
+                    # through to a normal chat send (finish content is empty).
+                    if self.config.hint_mode == "live":
+                        await self._mark_live_hint_tool_done(msg.chat_id, msg.metadata)
                     return
-                if self.config.hint_mode == "inline":
-                    if not progress_event.tool_events:
-                        # Status events (e.g. token-consolidation) have no tool
-                        # events and are only meaningful on the live card.
+                if progress_event.tool_hint:
+                    hint = (msg.content or "").strip()
+                    has_tool_events = bool(progress_event.tool_events)
+                    if not hint and not has_tool_events:
                         return
-                    await self._send_inline_tool_hint(msg, hint, receive_id_type, loop)
-                    return
-                # Live mode: drive the dedicated live progress card only —
-                # one line per tool, latest line replaces the previous.
-                has_tool_events = bool(progress_event.tool_events)
-                lines = format_tool_event_lines(
-                    progress_event.tool_events,
-                    max_length=self.config.live_tool_hint_max_length,
-                )
-                if not lines:
-                    lines = [ln for ln in self.__class__._format_tool_hint_lines(hint).split("\n") if ln.strip()]
-                for idx, line in enumerate(lines):
-                    rendered = f"{self.config.tool_hint_prefix} {line}"
-                    if has_tool_events:
-                        rendered = self._render_live_hint_line(rendered)
-                    await self._update_live_hint_card(
-                        msg.chat_id,
-                        msg.metadata,
-                        rendered,
-                        force=(idx == len(lines) - 1),
+                    if self.config.hint_mode == "inline":
+                        if not has_tool_events:
+                            # Status events (e.g. token-consolidation) have no tool
+                            # events and are only meaningful on the live card.
+                            return
+                        if not hint:
+                            return
+                        await self._send_inline_tool_hint(msg, hint, receive_id_type, loop)
+                        return
+                    # Live mode: drive the dedicated live progress card only —
+                    # one line per tool, latest line replaces the previous.
+                    lines = format_tool_event_lines(
+                        progress_event.tool_events,
+                        max_length=self.config.live_tool_hint_max_length,
                     )
-                return
+                    if not lines:
+                        lines = [ln for ln in self.__class__._format_tool_hint_lines(hint).split("\n") if ln.strip()]
+                    if not lines:
+                        return
+                    stream_key = self._stream_key(msg.chat_id, msg.metadata)
+                    consolidating = any(
+                        ln.startswith("consolidating history") for ln in lines
+                    )
+                    reopen_consolidation = consolidating and (
+                        stream_key in self._live_hint_finalized
+                        or msg.chat_id in self._live_hint_finalized
+                    )
+                    if has_tool_events or consolidating:
+                        self._live_hint_finalized.discard(stream_key)
+                        self._live_hint_finalized.discard(msg.chat_id)
+                    prev = self._live_hint_bufs.get(stream_key)
+                    leave_thinking = bool(prev and prev.thinking_status and has_tool_events)
+                    for idx, line in enumerate(lines):
+                        thinking_status = False
+                        if has_tool_events:
+                            rendered = self._render_live_hint_line(
+                                f"{self.config.tool_hint_prefix} {line}"
+                            )
+                        else:
+                            # Status (thinking / consolidation): no wrench prefix.
+                            # Trailing "..." (thinking) is stripped so the shared
+                            # · pulse reads "AI thinking ·", not "AI thinking ... ·".
+                            thinking_status = line.endswith("...")
+                            rendered = line.rstrip(".").rstrip() if thinking_status else line
+                        await self._update_live_hint_card(
+                            msg.chat_id,
+                            msg.metadata,
+                            rendered,
+                            force=has_tool_events or (idx == len(lines) - 1) or leave_thinking,
+                            thinking_status=thinking_status,
+                            mark_tool_in_flight=has_tool_events and not thinking_status,
+                        )
+                    if reopen_consolidation:
+                        buf = self._live_hint_bufs.get(stream_key)
+                        if buf is not None:
+                            buf.post_turn_consolidation = True
+                    if any(ln.strip() == "history consolidated" for ln in lines):
+                        buf = self._live_hint_bufs.get(stream_key)
+                        if buf is not None and buf.post_turn_consolidation:
+                            await self._finalize_live_hint_card(msg.chat_id, msg.metadata)
+                    return
 
             if (
                 msg.content.strip() == "New session started."
@@ -2745,6 +2855,10 @@ class FeishuChannel(BaseChannel):
             }
             if history_only:
                 metadata[INBOUND_META_HISTORY_ONLY] = True
+            # New user turn may show thinking again — clear prior finalize guards.
+            if not history_only:
+                self._live_hint_finalized.discard(reply_to)
+                self._live_hint_finalized.discard(message_id)
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
@@ -2881,6 +2995,16 @@ class FeishuChannel(BaseChannel):
         return f"{line}{suffix}"
 
     @staticmethod
+    def _live_tool_events_are_finish(tool_events: list[dict[str, Any]] | None) -> bool:
+        """True when *tool_events* is a batch-finish payload (phase end/error)."""
+        if not tool_events:
+            return False
+        return any(
+            isinstance(event, dict) and event.get("phase") in ("end", "error")
+            for event in tool_events
+        )
+
+    @staticmethod
     def _swap_live_note_to_done(text: str, *, processing_note: str, done_note: str) -> str:
         """Replace a trailing processing note with the done note (no-op if absent)."""
         note = (processing_note or "").strip()
@@ -2889,6 +3013,235 @@ class FeishuChannel(BaseChannel):
             return f"{text[: -len(f' - {note}')]} - {done}"
         return text
 
+    def _finalize_live_hint_text(self, buf: _FeishuStreamBuf) -> str:
+        """Freeze-line text: tool processing→done, or thinking ``AI thinking - done``."""
+        swapped = self._swap_live_note_to_done(
+            buf.text,
+            processing_note=self.config.live_tool_hint_processing_note,
+            done_note=self.config.live_tool_hint_done_note,
+        )
+        if swapped != buf.text:
+            return swapped
+        done = (self.config.live_tool_hint_done_note or "").strip()
+        if not done or not buf.thinking_status:
+            return buf.text
+        suffix = f" - {done}"
+        if buf.text.endswith(suffix):
+            return buf.text
+        return f"{buf.text.rstrip('.').rstrip()}{suffix}"
+
+    @classmethod
+    def _live_stream_reset_seed(cls, new: str) -> str:
+        """Prefix of *new* used to break the previous CardKit typewriter stream.
+
+        Feishu typewrites only when the next payload extends the last one, so
+        the reset must be a prefix of the line we are about to show — not an
+        unrelated glyph such as ``-``. A one-character markdown-special body
+        (list marker, heading, quote, table, code) is extended until the seed
+        is safe.
+        """
+        if not new:
+            return new
+        i = 1
+        while i < len(new) and new[:i] in cls._LIVE_STREAM_UNSAFE_SEEDS:
+            i += 1
+        return new[:i]
+
+    @classmethod
+    def _needs_live_stream_reset(cls, old: str, new: str) -> bool:
+        """True when Feishu would not typewrite *new* as a prefix/extension of *old*."""
+        if not old or not new or old == new:
+            return False
+        return not (new.startswith(old) or old.startswith(new))
+
+    async def _write_live_card_content(
+        self,
+        buf: _FeishuStreamBuf,
+        loop: asyncio.AbstractEventLoop,
+        card_id: str,
+        content: str,
+        sequence: int,
+    ) -> bool:
+        """One CardKit content write; always harvest the sequence, even if cancelled."""
+        fut = loop.run_in_executor(
+            None, self._stream_update_text_with_reopen_sync, card_id, content, sequence
+        )
+        try:
+            ok, used = await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            if fut.done():
+                ok, used = fut.result()
+                buf.sequence = max(buf.sequence, used)
+                if ok:
+                    buf.last_payload = content
+            raise
+        buf.sequence = max(buf.sequence, used)
+        if ok:
+            buf.last_payload = content
+        return ok
+
+    async def _commit_live_card_content(
+        self,
+        buf: _FeishuStreamBuf,
+        loop: asyncio.AbstractEventLoop,
+        card_id: str,
+        content: str,
+        sequence: int,
+    ) -> bool:
+        """Write *content*, seeding a prefix of it when it is not a prefix delta.
+
+        With ``print_strategy`` ``fast``, skip the one-char seed: Feishu
+        pre-flushes the previous payload, so a lone wrench glyph cannot stick
+        as the visible line between thinking and the first tool hint.
+        ``delay`` still seeds so non-prefix replaces can typewrite.
+        """
+        if (
+            self.config.live_tool_hint_print_strategy != "fast"
+            and self._needs_live_stream_reset(buf.last_payload, content)
+        ):
+            seed = self._live_stream_reset_seed(content)
+            if seed and seed != content:
+                ok = await self._write_live_card_content(
+                    buf, loop, card_id, seed, sequence
+                )
+                sequence = buf.sequence + 1 if ok else max(sequence, buf.sequence) + 1
+        return await self._write_live_card_content(buf, loop, card_id, content, sequence)
+
+    def _live_typewriter_seconds(self, text: str) -> float:
+        """Estimated Feishu typewriter duration for *text* (no client callback).
+
+        When ``live_tool_hint_typewriter_cap_ms`` is > 0, the wait/busy window is
+        capped so long lines dwell at most that long; with ``print_strategy``
+        ``fast``, the next CardKit write dumps leftover characters.
+        """
+        freq_ms = self.config.live_tool_hint_print_frequency_ms
+        step = self.config.live_tool_hint_print_step
+        if freq_ms is None:
+            freq_ms = self._FEISHU_DEFAULT_PRINT_FREQUENCY_MS
+        if step is None:
+            step = self._FEISHU_DEFAULT_PRINT_STEP
+        step = max(int(step), 1)
+        n = max(len(text or ""), 1)
+        raw = math.ceil(n / step) * freq_ms / 1000.0
+        cap_ms = self.config.live_tool_hint_typewriter_cap_ms
+        if cap_ms > 0:
+            return min(raw, cap_ms / 1000.0)
+        return raw
+
+    def _live_line_hold_seconds(self, text: str) -> float:
+        """Typewriter estimate plus glance dwell before the next line may replace.
+
+        ``live_tool_hint_typewriter_cap_ms`` still caps the print animation;
+        ``live_tool_hint_min_dwell_ms`` is an extra readability floor so a
+        short hint is not overwritten in a flash. ``0`` dwell keeps the
+        typewriter-only wait.
+        """
+        return self._live_typewriter_seconds(text) + (
+            self.config.live_tool_hint_min_dwell_ms / 1000.0
+        )
+
+    def _live_typewriter_busy(self, buf: _FeishuStreamBuf, *, now: float | None = None) -> bool:
+        """True while the last non-heartbeat line is still inside the hold window."""
+        if buf.last_line_write <= 0.0:
+            return False
+        if now is None:
+            now = time.monotonic()
+        return now < buf.last_line_write + self._live_line_hold_seconds(buf.text)
+
+    def _live_thinking_wait_until(self, buf: _FeishuStreamBuf, *, now: float) -> float | None:
+        """When thinking may commit, or None to drop it.
+
+        ``None`` — a tool batch is still in flight; drop this thinking event
+        (waiting would deadlock the outbound dispatcher, because finish is
+        the next queued message). A positive timestamp — sleep until then
+        (done-hold and/or remaining hold of the current non-thinking
+        line). ``0`` — commit now.
+        """
+        if buf.tool_in_flight and buf.card_id and buf.text:
+            return None
+        wait_until = buf.done_hold_until
+        if buf.card_id and buf.text and not buf.thinking_status and buf.last_line_write > 0.0:
+            wait_until = max(
+                wait_until,
+                buf.last_line_write + self._live_line_hold_seconds(buf.text),
+            )
+        if wait_until > now:
+            return wait_until
+        return 0.0
+
+    async def _mark_live_hint_tool_done(
+        self, chat_id: str, metadata: dict[str, Any] | None
+    ) -> None:
+        """Swap the visible tool line to ``- done`` and start the done-hold.
+
+        Waits out the remaining line-hold window first so a fast tool still
+        shows ``- processing`` long enough to glance. Heartbeat is cancelled
+        at the swap so the done line stays static until thinking (or the next
+        tool) takes over. Does not close streaming — the turn is still running.
+        """
+        if self.config.hint_mode != "live":
+            return
+        stream_key = self._stream_key(chat_id, metadata)
+        buf = self._live_hint_bufs.get(stream_key)
+        if (not buf or not buf.card_id) and stream_key != chat_id:
+            alt = self._live_hint_bufs.get(chat_id)
+            if alt and alt.card_id:
+                stream_key = chat_id
+                buf = alt
+        if not buf or not buf.card_id:
+            return
+        loop = asyncio.get_running_loop()
+        while True:
+            wake_at: float | None = None
+            async with buf.lock:
+                live = self._live_hint_bufs.get(stream_key)
+                if live is None or not live.card_id:
+                    return
+                buf = live
+                now = time.monotonic()
+                if (
+                    buf.last_line_write > 0.0
+                    and buf.text
+                    and now < buf.last_line_write + self._live_line_hold_seconds(buf.text)
+                ):
+                    wake_at = buf.last_line_write + self._live_line_hold_seconds(buf.text)
+                if wake_at is None:
+                    buf.tool_in_flight = False
+                    buf.elapsed_started_at = 0.0
+                    self._cancel_live_hint_heartbeat(stream_key)
+                    done_text = self._swap_live_note_to_done(
+                        buf.text,
+                        processing_note=self.config.live_tool_hint_processing_note,
+                        done_note=self.config.live_tool_hint_done_note,
+                    )
+                    if done_text != buf.text:
+                        buf.text = done_text
+                        buf.thinking_status = False
+                        buf.heartbeat_pulse = 0
+                        ok = await self._commit_live_card_content(
+                            buf, loop, buf.card_id, buf.text, buf.sequence + 1
+                        )
+                        if ok:
+                            committed_at = time.monotonic()
+                            buf.last_edit = committed_at
+                            buf.last_line_write = committed_at
+                    hold_s = self.config.live_tool_hint_done_hold_ms / 1000.0
+                    buf.done_hold_until = now + hold_s
+                    return
+
+            remaining = wake_at - time.monotonic() if wake_at is not None else 0.0
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            if (
+                stream_key in self._live_hint_finalized
+                or chat_id in self._live_hint_finalized
+            ) and stream_key not in self._live_hint_bufs:
+                return
+            nxt = self._live_hint_bufs.get(stream_key)
+            if nxt is None:
+                return
+            buf = nxt
+
     async def _update_live_hint_card(
         self,
         chat_id: str,
@@ -2896,14 +3249,20 @@ class FeishuChannel(BaseChannel):
         line: str,
         *,
         force: bool = False,
+        thinking_status: bool = False,
+        mark_tool_in_flight: bool = False,
     ) -> None:
         """Show *line* on the dedicated live progress card (replace, not append).
 
         The card is created on first use; every tool hint replaces its single
         line so the user sees work advance without one message per tool.
-        Updates are throttled to ``_STREAM_EDIT_INTERVAL`` holding the latest
-        text; *force* bypasses the throttle so the final line of a batch is
-        always flushed to the card.
+        Successive non-thinking lines wait for the previous line-hold window
+        (typewriter estimate plus glance dwell) before committing, so a
+        multi-tool batch plays sequentially and stays readable. Thinking
+        that arrives while a tool batch is still in flight is dropped.
+        After the batch finishes, thinking waits for the done-hold, then
+        replaces. Heartbeat is cancelled at commit so a pulse cannot land
+        after takeover.
         """
         if self.config.hint_mode != "live":
             return
@@ -2914,96 +3273,188 @@ class FeishuChannel(BaseChannel):
         stream_key = self._stream_key(chat_id, metadata)
         buf = self._live_hint_bufs.get(stream_key)
         if buf is None:
+            if thinking_status and (
+                stream_key in self._live_hint_finalized
+                or chat_id in self._live_hint_finalized
+            ):
+                # Stale thinking after turn-end finalize — do not reopen the card.
+                return
             buf = _FeishuStreamBuf()
             self._live_hint_bufs[stream_key] = buf
-        buf.text = line
-        now = time.monotonic()
-        if buf.card_id is None:
-            rid_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
-            meta = metadata or {}
-            use_reply_in_thread = self._should_use_reply_in_thread(meta)
-            reply_msg_id = self._thread_reply_target(meta)
-            card_id = await loop.run_in_executor(
-                None,
-                lambda: self._create_streaming_card_sync(
-                    rid_type,
-                    chat_id,
-                    reply_msg_id,
-                    reply_in_thread=use_reply_in_thread,
-                ),
-            )
-            if not card_id:
+
+        while True:
+            wake_at: float | None = None
+            # Serialize with the heartbeat loop (and finalize) so the shared
+            # ``buf.sequence`` is never read-modify-written concurrently — Feishu
+            # rejects out-of-order sequences with 300317.
+            async with buf.lock:
+                live = self._live_hint_bufs.get(stream_key)
+                if live is None:
+                    # Finalized or cleared while we waited — do not reopen.
+                    return
+                buf = live
+                now = time.monotonic()
+                if thinking_status:
+                    thinking_wait = self._live_thinking_wait_until(buf, now=now)
+                    if thinking_wait is None:
+                        return
+                    if thinking_wait > now:
+                        wake_at = thinking_wait
+                # Non-thinking: finish the previous line's hold before replace.
+                elif (
+                    buf.card_id
+                    and buf.text
+                    and self._live_typewriter_busy(buf, now=now)
+                ):
+                    wake_at = buf.last_line_write + self._live_line_hold_seconds(buf.text)
+                if wake_at is None:
+                    self._cancel_live_hint_heartbeat(stream_key)
+                    was_thinking = buf.thinking_status
+                    buf.text = line
+                    buf.thinking_status = thinking_status
+                    buf.heartbeat_pulse = 0
+                    if mark_tool_in_flight:
+                        buf.tool_in_flight = True
+                        buf.done_hold_until = 0.0
+                        buf.elapsed_started_at = now
+                    elif thinking_status:
+                        buf.tool_in_flight = False
+                        buf.done_hold_until = 0.0
+                        if not was_thinking or buf.elapsed_started_at <= 0:
+                            buf.elapsed_started_at = now
+                    elif line.startswith("consolidating history"):
+                        if buf.elapsed_started_at <= 0:
+                            buf.elapsed_started_at = now
+                    else:
+                        buf.elapsed_started_at = 0.0
+                    leave_thinking = was_thinking and not thinking_status
+                    # After the typewriter wait, always flush non-thinking lines
+                    # (tool/status); thinking still respects throttle unless forced.
+                    should_write = (
+                        force
+                        or leave_thinking
+                        or not thinking_status
+                        or (now - buf.last_edit) >= self._STREAM_EDIT_INTERVAL
+                    )
+                    if buf.card_id is None:
+                        rid_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
+                        meta = metadata or {}
+                        use_reply_in_thread = self._should_use_reply_in_thread(meta)
+                        reply_msg_id = self._thread_reply_target(meta)
+                        card_created = await loop.run_in_executor(
+                            None,
+                            lambda: self._create_streaming_card_sync(
+                                rid_type,
+                                chat_id,
+                                reply_msg_id,
+                                reply_in_thread=use_reply_in_thread,
+                            ),
+                        )
+                        if not card_created:
+                            return
+                        card_id, chat_message_id = card_created
+                        ok = await self._commit_live_card_content(buf, loop, card_id, line, 1)
+                        if ok:
+                            # Hold starts when the write returns so CardKit RTT
+                            # cannot eat liveToolHintMinDwellMs before the next line.
+                            committed_at = time.monotonic()
+                            buf.card_id = card_id
+                            buf.message_id = chat_message_id
+                            buf.last_edit = committed_at
+                            buf.last_heartbeat = committed_at
+                            buf.last_line_write = committed_at
+                        else:
+                            await loop.run_in_executor(
+                                None, self._close_streaming_mode_sync, card_id, buf.sequence + 1
+                            )
+                    elif should_write:
+                        ok = await self._commit_live_card_content(
+                            buf, loop, buf.card_id, line, buf.sequence + 1
+                        )
+                        if ok:
+                            committed_at = time.monotonic()
+                            buf.last_edit = committed_at
+                            buf.last_line_write = committed_at
+                    self._arm_live_hint_heartbeat(chat_id, stream_key)
+                    return
+
+            remaining = wake_at - time.monotonic() if wake_at is not None else 0.0
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            if (
+                stream_key in self._live_hint_finalized
+                or chat_id in self._live_hint_finalized
+            ) and stream_key not in self._live_hint_bufs:
                 return
-            ok, sequence = await loop.run_in_executor(
-                None, self._stream_update_text_with_reopen_sync, card_id, line, 1
-            )
-            if ok:
-                buf.card_id = card_id
-                buf.sequence = sequence
-                buf.last_edit = now
-                buf.last_heartbeat = now
-            else:
-                await loop.run_in_executor(
-                    None, self._close_streaming_mode_sync, card_id, sequence + 1
-                )
-        elif force or (now - buf.last_edit) >= self._STREAM_EDIT_INTERVAL:
-            ok, buf.sequence = await loop.run_in_executor(
-                None,
-                self._stream_update_text_with_reopen_sync,
-                buf.card_id,
-                buf.text,
-                buf.sequence + 1,
-            )
-            if ok:
-                buf.last_edit = now
-        self._arm_live_hint_heartbeat(chat_id, stream_key)
+            nxt = self._live_hint_bufs.get(stream_key)
+            if nxt is None:
+                return
+            buf = nxt
 
     async def _finalize_live_hint_card(
         self, chat_id: str, metadata: dict[str, Any] | None
     ) -> None:
-        """Freeze the live progress card (flush latest line, close streaming)."""
+        """Freeze the live progress card (flush latest line, close streaming).
+
+        Thinking lines become ``AI thinking - done``; tool lines swap
+        ``processing`` → ``done``. Heartbeat is cancelled so the card stops pulsing.
+        """
         stream_key = self._stream_key(chat_id, metadata)
-        self._cancel_live_hint_heartbeat(stream_key)
-        buf = self._live_hint_bufs.pop(stream_key, None)
+        buf = self._live_hint_bufs.get(stream_key)
+        # Fallback when stream_end metadata lacks message_id but the live card
+        # was keyed by chat_id (or the reverse).
+        if (not buf or not buf.card_id) and stream_key != chat_id:
+            alt = self._live_hint_bufs.get(chat_id)
+            if alt and alt.card_id:
+                stream_key = chat_id
+                buf = alt
         if not buf or not buf.card_id:
+            self._cancel_live_hint_heartbeat(stream_key)
+            self._live_hint_bufs.pop(stream_key, None)
+            self._live_hint_finalized.add(stream_key)
+            self._live_hint_finalized.add(chat_id)
             return
         loop = asyncio.get_running_loop()
-        if buf.text:
-            buf.text = self._swap_live_note_to_done(
-                buf.text,
-                processing_note=self.config.live_tool_hint_processing_note,
-                done_note=self.config.live_tool_hint_done_note,
-            )
+        # Acquire the lock *before* cancelling the heartbeat so an in-flight
+        # CardKit write can commit its sequence. Cancelling first lets
+        # CancelledError skip ``buf.sequence = max(...)`` after Feishu already
+        # accepted N, and finalize then replays N (300317).
+        async with buf.lock:
+            self._cancel_live_hint_heartbeat(stream_key)
+            self._live_hint_bufs.pop(stream_key, None)
+            self._live_hint_finalized.add(stream_key)
+            self._live_hint_finalized.add(chat_id)
+            buf.elapsed_started_at = 0.0
+            buf.tool_in_flight = False
+            if buf.text:
+                buf.text = self._finalize_live_hint_text(buf)
+                ok = await self._commit_live_card_content(
+                    buf, loop, buf.card_id, buf.text, buf.sequence + 1
+                )
+                if not ok:
+                    buf.sequence += 1
+                    await loop.run_in_executor(
+                        None, self._close_streaming_mode_sync, buf.card_id, buf.sequence
+                    )
+                    return
             buf.sequence += 1
-            ok, buf.sequence = await loop.run_in_executor(
-                None,
-                self._stream_update_text_with_reopen_sync,
-                buf.card_id,
-                buf.text,
-                buf.sequence,
+            closed = await loop.run_in_executor(
+                None, self._close_streaming_mode_sync, buf.card_id, buf.sequence
             )
-            if not ok:
+            if not closed:
                 buf.sequence += 1
                 await loop.run_in_executor(
                     None, self._close_streaming_mode_sync, buf.card_id, buf.sequence
                 )
-                return
-        buf.sequence += 1
-        closed = await loop.run_in_executor(
-            None, self._close_streaming_mode_sync, buf.card_id, buf.sequence
-        )
-        if not closed:
-            buf.sequence += 1
-            await loop.run_in_executor(
-                None, self._close_streaming_mode_sync, buf.card_id, buf.sequence
-            )
 
     def _arm_live_hint_heartbeat(self, chat_id: str, stream_key: str) -> None:
         """Start (or restart) the pulse refresh for a live hint card.
 
         The heartbeat re-sends the card's latest line every
-        ``live_tool_hint_heartbeat_seconds`` so a long-running tool without
-        new hint events still feels alive.  A value of ``0`` disables it.
+        ``live_tool_hint_heartbeat_seconds`` so a long-running step without
+        new hint events still feels alive. A value of ``0`` disables it.
+        Restarting writes the new line, then the first pulse follows on
+        the next event-loop turn (plus CardKit RTT).
         """
         interval = self.config.live_tool_hint_heartbeat_seconds
         if interval <= 0 or self.config.hint_mode != "live":
@@ -3022,32 +3473,70 @@ class FeishuChannel(BaseChannel):
         if task is not None and not task.done():
             task.cancel()
 
+    def _live_hint_heartbeat_payload(
+        self, buf: _FeishuStreamBuf, *, now: float | None = None
+    ) -> str:
+        """Advance animation state and return the next CardKit payload.
+
+        Two-frame blink ``··`` ↔ ``·····``. *buf.text* is never mutated.
+        In-progress lines (in-flight tools, ``AI thinking``, and
+        ``consolidating history``) insert a one-decimal elapsed label between
+        the line and the pulse once elapsed meets
+        ``live_tool_hint_elapsed_after_ms``.
+        """
+        buf.heartbeat_pulse = (buf.heartbeat_pulse + 1) % 2
+        pulse = "\u00b7" * 2 if buf.heartbeat_pulse == 0 else "\u00b7" * 5
+        elapsed_part = ""
+        show_elapsed = buf.elapsed_started_at > 0 and (
+            buf.tool_in_flight
+            or buf.thinking_status
+            or buf.text.startswith("consolidating history")
+        )
+        if show_elapsed:
+            elapsed = (time.monotonic() if now is None else now) - buf.elapsed_started_at
+            threshold_s = self.config.live_tool_hint_elapsed_after_ms / 1000.0
+            if elapsed >= threshold_s:
+                label = f"{elapsed:.1f}s"
+                if label != "0.0s":
+                    elapsed_part = f" {label}"
+        return f"{buf.text}{elapsed_part} {pulse}"
+
     async def _live_hint_heartbeat_loop(
         self, chat_id: str, stream_key: str, interval: float
     ) -> None:
-        """Periodically re-send the live hint card line with a growing pulse."""
+        """Refresh the live hint card on a fixed monotonic schedule.
+
+        Thinking and tool lines share a ``··`` / ``·····`` blink. The first
+        tick is scheduled immediately, but pulses are deferred while the last
+        non-heartbeat line is still inside the line-hold window (typewriter
+        estimate plus glance dwell) so the full hint can finish before pulse
+        dots land. Later ticks wait *interval*,
+        though the visible floor is ``max(interval, CardKit RTT)``. Missed
+        deadlines skip frames instead of bursting catch-up writes.
+        """
         loop = asyncio.get_running_loop()
+        next_tick = time.monotonic()
         while True:
-            await asyncio.sleep(interval)
+            await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
             buf = self._live_hint_bufs.get(stream_key)
             if buf is None or not buf.card_id or not buf.text:
                 return
-            now = time.monotonic()
-            if buf.last_edit > buf.last_heartbeat:
-                # A real event updated the card after the last tick — reset the
-                # marker rather than re-sending over a fresh line.
-                buf.last_heartbeat = now
-                continue
-            # Re-send the latest line with a subtle growing pulse so the card
-            # visibly progresses even when no new tool hint has arrived.
-            buf.heartbeat_pulse = (buf.heartbeat_pulse + 1) % 4
-            pulse = "\u00b7" * (buf.heartbeat_pulse + 1)
-            ok, buf.sequence = await loop.run_in_executor(
-                None,
-                self._stream_update_text_with_reopen_sync,
-                buf.card_id,
-                f"{buf.text} {pulse}",
-                buf.sequence + 1,
-            )
+            ok = False
+            async with buf.lock:
+                # Takeover / finalize may have swapped the card while we waited.
+                if not buf.card_id or not buf.text:
+                    return
+                now = time.monotonic()
+                if self._live_typewriter_busy(buf, now=now):
+                    next_tick = buf.last_line_write + self._live_line_hold_seconds(buf.text)
+                    continue
+                content = self._live_hint_heartbeat_payload(buf, now=now)
+                ok = await self._commit_live_card_content(
+                    buf, loop, buf.card_id, content, buf.sequence + 1
+                )
             if ok:
-                buf.last_heartbeat = now
+                buf.last_heartbeat = time.monotonic()
+            next_tick += interval
+            now = time.monotonic()
+            while next_tick <= now:
+                next_tick += interval

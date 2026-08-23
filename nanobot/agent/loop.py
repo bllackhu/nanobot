@@ -412,6 +412,9 @@ class AgentLoop:
             asyncio.Semaphore(_max) if _max > 0 else None
         )
         self._turn_status_callbacks: dict[str, Callable[..., Awaitable[None]]] = {}
+        # Background post-turn consolidation may still own this session's
+        # progress callback after the turn's ``finally`` would otherwise pop it.
+        self._post_turn_status_holds: dict[str, Callable[..., Awaitable[None]]] = {}
         self.consolidator = Consolidator(
             store=self.context.memory,
             sessions=self.sessions,
@@ -1453,6 +1456,41 @@ class AgentLoop:
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
 
+    async def _maybe_consolidate_with_progress(
+        self,
+        session: Session,
+        *,
+        runtime: LLMRuntime,
+        replay_max_messages: int | None,
+        on_progress: Callable[..., Awaitable[None]] | None,
+    ) -> None:
+        """Run post-turn token consolidation with the turn's progress callback.
+
+        The turn's ``finally`` pops ``_turn_status_callbacks`` as soon as the
+        answer is done. Reinstall *on_progress* for this call only so status
+        still reaches the bus (e.g. a Feishu live card). Do not overwrite a
+        newer turn's callback, and do not pop one we do not own.
+        """
+        key = session.key
+        claimed = False
+        if on_progress is not None:
+            current = self._turn_status_callbacks.get(key)
+            if current is None or current is on_progress:
+                self._turn_status_callbacks[key] = on_progress
+                self._post_turn_status_holds[key] = on_progress
+                claimed = True
+        try:
+            await self.consolidator.maybe_consolidate_by_tokens(
+                session,
+                runtime=runtime,
+                replay_max_messages=replay_max_messages,
+            )
+        finally:
+            if claimed and self._post_turn_status_holds.get(key) is on_progress:
+                self._post_turn_status_holds.pop(key, None)
+            if claimed and self._turn_status_callbacks.get(key) is on_progress:
+                self._turn_status_callbacks.pop(key, None)
+
     async def _consolidation_status(self, session_key: str, content: str) -> None:
         """Route consolidation status to the active turn's progress callback.
 
@@ -1558,12 +1596,13 @@ class AgentLoop:
         self._clear_runtime_checkpoint(session)
         self.sessions.save(session)
         self._schedule_background(
-            self.consolidator.maybe_consolidate_by_tokens(
+            self._maybe_consolidate_with_progress(
                 session,
                 runtime=runtime,
                 replay_max_messages=replay_max_messages_for_context(
                     runtime.context_window_tokens
                 ),
+                on_progress=on_progress,
             )
         )
         content = final_content or "Background task completed."
@@ -1648,7 +1687,12 @@ class AgentLoop:
         try:
             return await self._run_turn_state_machine(ctx)
         finally:
-            self._turn_status_callbacks.pop(key, None)
+            # Leave the slot in place when post-turn consolidation already
+            # claimed this same callback; the helper pops it when it finishes.
+            held = self._post_turn_status_holds.get(key)
+            current = self._turn_status_callbacks.get(key)
+            if held is None or held is not current:
+                self._turn_status_callbacks.pop(key, None)
 
     async def _run_turn_state_machine(self, ctx: TurnContext) -> OutboundMessage | None:
         while ctx.state is not TurnState.DONE:
@@ -1938,12 +1982,13 @@ class AgentLoop:
                 on_archive=partial(self.context.memory.raw_archive, session_key=ctx.session_key)
             )
             self._schedule_background(
-                self.consolidator.maybe_consolidate_by_tokens(
+                self._maybe_consolidate_with_progress(
                     ctx.session,
                     runtime=ctx.runtime,
                     replay_max_messages=replay_max_messages_for_context(
                         ctx.runtime.context_window_tokens
                     ),
+                    on_progress=ctx.on_progress,
                 )
             )
         self._clear_pending_user_turn(ctx.session)

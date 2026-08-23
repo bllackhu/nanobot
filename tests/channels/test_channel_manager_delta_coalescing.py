@@ -376,6 +376,44 @@ class TestProgressFiltering:
         assert send_mock.await_args.args[0].content == "processing sentinel"
 
     @pytest.mark.asyncio
+    async def test_tool_finish_events_pass_when_tool_hints_enabled(self, manager, bus):
+        """Finish payloads use tool_hint=False but still reach channels with tool hints on."""
+        manager.channels["mock"].send_progress = False
+        manager.channels["mock"].send_tool_hints = True
+        await bus.publish_outbound(outbound_message_for_event(
+            channel="mock",
+            chat_id="chat1",
+            event=ProgressEvent(
+                content="",
+                tool_hint=False,
+                tool_events=[{
+                    "version": 1,
+                    "phase": "end",
+                    "call_id": "c1",
+                    "name": "read_file",
+                }],
+            ),
+        ))
+
+        task = asyncio.create_task(manager._dispatch_outbound())
+        try:
+            for _ in range(30):
+                if manager.channels["mock"]._send_mock.await_count >= 1:
+                    break
+                await asyncio.sleep(0.05)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        send_mock = manager.channels["mock"]._send_mock
+        assert send_mock.await_count == 1
+        sent = send_mock.await_args.args[0]
+        assert sent.event.tool_events[0]["phase"] == "end"
+
+    @pytest.mark.asyncio
     async def test_channel_override_can_enable_tool_hints(self, manager, bus):
         manager.channels["mock"].send_tool_hints = True
         await bus.publish_outbound(outbound_message_for_event(

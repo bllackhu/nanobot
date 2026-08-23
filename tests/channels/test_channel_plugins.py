@@ -2788,8 +2788,8 @@ async def test_send_with_retry_calls_send_delta():
 
 
 @pytest.mark.asyncio
-async def test_send_with_retry_skips_send_when_streamed():
-    """_send_with_retry should not call send for streamed response events."""
+async def test_send_with_retry_invokes_send_for_streamed_response():
+    """StreamedResponseEvent goes through send() so channels can finalize mid-turn UI."""
     send_called = False
     send_delta_called = False
 
@@ -2839,7 +2839,7 @@ async def test_send_with_retry_skips_send_when_streamed():
     )
     await mgr._send_with_retry(mgr.channels["streamed"], msg)
 
-    assert send_called is False
+    assert send_called is True
     assert send_delta_called is False
 
 

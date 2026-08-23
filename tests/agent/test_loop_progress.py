@@ -978,3 +978,61 @@ class TestConsolidationStatusWiring:
         }
         assert status_msgs[0].chat_id == "chat1"
         assert status_msgs[1].chat_id == "chat1"
+
+    @pytest.mark.asyncio
+    async def test_post_turn_consolidation_status_lands_on_bus_progress(
+        self, tmp_path: Path
+    ) -> None:
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Done", tool_calls=[]))
+        loop = AgentLoop(bus=bus, provider=provider, workspace=tmp_path, model="test-model")
+        _attach_webui_runtime_events(loop, bus)
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        calls = {"n": 0}
+
+        async def fake_consolidate(session, *, runtime, replay_max_messages=None) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Pre-turn path still has the turn callback; skip like idle.
+                return
+            cb = loop._turn_status_callbacks.get(session.key)
+            assert cb is not None, "post-turn consolidation must reinstall on_progress"
+            from nanobot.utils.progress_events import invoke_on_progress_status
+
+            await invoke_on_progress_status(cb, "consolidating history (1200/8000 tokens)")
+            await invoke_on_progress_status(cb, "history consolidated")
+
+        loop.consolidator.maybe_consolidate_by_tokens = fake_consolidate  # type: ignore[method-assign]
+
+        await loop._dispatch(InboundMessage(
+            channel="telegram",
+            sender_id="u1",
+            chat_id="chat1",
+            content="say hello",
+        ))
+        if loop._background_tasks:
+            await asyncio.gather(*list(loop._background_tasks), return_exceptions=True)
+
+        outbound = []
+        while bus.outbound_size > 0:
+            outbound.append(await bus.consume_outbound())
+
+        status_msgs = [
+            m
+            for m in outbound
+            if isinstance(m.event, ProgressEvent)
+            and m.event.tool_hint
+            and m.event.tool_events is None
+            and "consolidat" in (m.content or "")
+        ]
+        assert calls["n"] >= 2
+        assert status_msgs, "expected post-turn consolidation status on the bus"
+        assert {status_msgs[0].content, status_msgs[1].content} == {
+            "consolidating history (1200/8000 tokens)",
+            "history consolidated",
+        }
+        assert loop._turn_status_callbacks.get("telegram:chat1") is None
+        assert loop._post_turn_status_holds.get("telegram:chat1") is None

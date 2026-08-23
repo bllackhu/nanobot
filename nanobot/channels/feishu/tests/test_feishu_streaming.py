@@ -88,9 +88,9 @@ class TestCreateStreamingCard:
     def test_returns_card_id_on_success(self):
         ch = _make_channel()
         ch._client.cardkit.v1.card.create.return_value = _mock_create_card_response("card_123")
-        ch._client.im.v1.message.create.return_value = _mock_send_response()
+        ch._client.im.v1.message.create.return_value = _mock_send_response("om_stream_001")
         result = ch._create_streaming_card_sync("chat_id", "oc_chat1")
-        assert result == "card_123"
+        assert result == ("card_123", "om_stream_001")
         ch._client.cardkit.v1.card.create.assert_called_once()
         ch._client.im.v1.message.create.assert_called_once()
 
