@@ -29,7 +29,7 @@ from loguru import logger
 from pydantic import Field
 
 from nanobot.bus.events import OutboundMessage
-from nanobot.bus.outbound_events import ProgressEvent
+from nanobot.bus.outbound_events import ProgressEvent, StreamedResponseEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.paths import get_media_dir, get_runtime_subdir
@@ -1103,6 +1103,10 @@ class WeixinChannel(BaseChannel):
         self._assert_session_active()
 
         event = getattr(msg, "event", None)
+        if isinstance(event, StreamedResponseEvent):
+            # Answer already delivered via send_delta at stream_end.
+            return
+
         progress_event = event if isinstance(event, ProgressEvent) else None
         is_progress = progress_event is not None
 

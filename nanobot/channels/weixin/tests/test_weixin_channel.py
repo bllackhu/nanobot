@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from nanobot.bus.outbound_events import ProgressEvent
+from nanobot.bus.outbound_events import ProgressEvent, StreamedResponseEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.weixin import runtime as weixin_mod
 from nanobot.channels.weixin.runtime import (
@@ -1856,6 +1856,35 @@ async def test_stream_end_resuming_then_final_still_sends_once() -> None:
 
     channel._send_text.assert_awaited_once_with("wx-user", "hello world", "ctx-1")
     assert "wx-user" not in channel._stream_buffers
+
+
+@pytest.mark.asyncio
+async def test_streamed_response_event_does_not_resend_after_stream_end() -> None:
+    """Answer delivered at stream_end must not be sent again on StreamedResponseEvent."""
+    from nanobot.bus.events import OutboundMessage
+
+    channel, _bus = _make_channel()
+    channel._client = object()
+    channel._token = "token"
+    channel._context_tokens["wx-user"] = "ctx-1"
+    channel._context_token_at["wx-user"] = time.time()
+    channel._send_text = AsyncMock()
+
+    await channel.send_delta("wx-user", "hello ", {"_stream_delta": True})
+    await channel.send_delta("wx-user", "world", {"_stream_end": True})
+
+    channel._send_text.assert_awaited_once_with("wx-user", "hello world", "ctx-1")
+
+    await channel.send(
+        OutboundMessage(
+            channel="weixin",
+            chat_id="wx-user",
+            content="hello world",
+            event=StreamedResponseEvent(),
+        )
+    )
+
+    channel._send_text.assert_awaited_once_with("wx-user", "hello world", "ctx-1")
 
 
 @pytest.mark.asyncio

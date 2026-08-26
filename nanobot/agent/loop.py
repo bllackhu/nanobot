@@ -378,6 +378,7 @@ class AgentLoop:
         )
         self._unified_session = unified_session
         self._running = False
+        self._warmup_task: asyncio.Task[None] | None = None
         self._mcp_servers = mcp_servers or {}
         self._mcp_stacks: dict[str, MCPConnection] = {}
         self._mcp_connecting = False
@@ -577,6 +578,76 @@ class AgentLoop:
     async def _connect_mcp(self) -> None:
         """Connect configured MCP servers."""
         await agent_context.connect_mcp(self, self.tools)
+
+    def _start_first_turn_warmup(self) -> None:
+        """Schedule lazy first-turn init while the gateway waits for inbound traffic."""
+        if self._warmup_task is not None and not self._warmup_task.done():
+            return
+        self._warmup_task = asyncio.create_task(
+            self._warmup_idle_path(),
+            name="nanobot-first-turn-warmup",
+        )
+
+    async def _await_first_turn_warmup(self) -> None:
+        """Wait for background warmup before the first BUILD if still in flight."""
+        task = self._warmup_task
+        if task is None or task.done():
+            return
+        await task
+
+    async def _warmup_idle_path(self) -> None:
+        """Pre-load tiktoken, tool schemas, HTTP client, and system prompt."""
+        from nanobot.utils.helpers import _get_token_encoding
+
+        total_start = time.perf_counter()
+        timings: dict[str, float] = {}
+
+        async def _warm_tiktoken() -> None:
+            step_start = time.perf_counter()
+            await asyncio.to_thread(_get_token_encoding)
+            timings["tiktoken"] = (time.perf_counter() - step_start) * 1000
+
+        async def _warm_tools() -> None:
+            step_start = time.perf_counter()
+            self.tools.get_definitions()
+            timings["tools"] = (time.perf_counter() - step_start) * 1000
+
+        async def _warm_client() -> None:
+            step_start = time.perf_counter()
+            provider = self.llm_runtime().provider
+            ensure_client = getattr(provider, "_ensure_client", None)
+            if callable(ensure_client):
+                await ensure_client()
+            timings["client"] = (time.perf_counter() - step_start) * 1000
+
+        async def _warm_prompt() -> None:
+            step_start = time.perf_counter()
+            await asyncio.to_thread(self.context.build_system_prompt)
+            timings["prompt"] = (time.perf_counter() - step_start) * 1000
+
+        async def _safe_step(name: str, step: Callable[[], Awaitable[None]]) -> None:
+            try:
+                await step()
+            except Exception as exc:
+                logger.warning("First-turn warmup step {} failed: {}", name, exc)
+
+        await asyncio.gather(
+            _safe_step("tiktoken", _warm_tiktoken),
+            _safe_step("tools", _warm_tools),
+            _safe_step("client", _warm_client),
+            _safe_step("prompt", _warm_prompt),
+        )
+
+        total_ms = (time.perf_counter() - total_start) * 1000
+        logger.info(
+            "First-turn warmup finished in {:.0f}ms "
+            "(tiktoken={:.0f} tools={:.0f} client={:.0f} prompt={:.0f})",
+            total_ms,
+            timings.get("tiktoken", 0),
+            timings.get("tools", 0),
+            timings.get("client", 0),
+            timings.get("prompt", 0),
+        )
 
     def register_runtime_context_provider(
         self,
@@ -999,6 +1070,7 @@ class AgentLoop:
         self._running = True
         try:
             await self._connect_mcp()
+            self._start_first_turn_warmup()
             logger.info("Agent loop started")
 
             while self._running:
@@ -1092,6 +1164,11 @@ class AgentLoop:
                     else None
                 )
         finally:
+            warmup_task = self._warmup_task
+            if warmup_task is not None and not warmup_task.done():
+                warmup_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await warmup_task
             # MCP stdio transports use AnyIO cancel scopes; close them from the task that opened them.
             await self.close_mcp()
 
@@ -1865,6 +1942,7 @@ class AgentLoop:
         return "dispatch"
 
     async def _state_build(self, ctx: TurnContext) -> str:
+        await self._await_first_turn_warmup()
         replay_max_messages = replay_max_messages_for_context(
             ctx.runtime.context_window_tokens
         )
