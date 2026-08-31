@@ -255,6 +255,7 @@ class TestCmdNewUnifiedSession:
             consolidator=SimpleNamespace(archive=AsyncMock(return_value=True)),
             _cancel_active_tasks=AsyncMock(return_value=0),
             llm_runtime=MagicMock(return_value=MagicMock()),
+            new_session_started_message="New session started.",
         )
         loop._schedule_background = lambda coro: asyncio.ensure_future(coro)
 
@@ -303,6 +304,7 @@ class TestCmdNewUnifiedSession:
             consolidator=SimpleNamespace(archive=AsyncMock(return_value=True)),
             _cancel_active_tasks=AsyncMock(return_value=0),
             llm_runtime=MagicMock(return_value=MagicMock()),
+            new_session_started_message="New session started.",
         )
         loop._schedule_background = lambda coro: asyncio.ensure_future(coro)
 

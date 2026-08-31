@@ -50,7 +50,7 @@ from nanobot.bus.runtime_events import (
     ensure_runtime_event_publisher,
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
-from nanobot.command.new_intent import is_new_session_phrase
+from nanobot.command.new_intent import effective_new_session_phrases, is_new_session_phrase
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
@@ -276,6 +276,8 @@ class AgentLoop:
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
         new_session_phrases: list[str] | None = None,
+        bot_name: str | None = None,
+        new_session_started_message: str | None = None,
         tools_config: ToolsConfig | None = None,
         image_generation_provider_config: ProviderConfig | None = None,
         image_generation_provider_configs: dict[str, ProviderConfig] | None = None,
@@ -374,10 +376,16 @@ class AgentLoop:
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
         )
         self._unified_session = unified_session
-        self.new_session_phrases = (
+        self.new_session_phrases = effective_new_session_phrases(
             list(new_session_phrases)
             if new_session_phrases is not None
-            else list(defaults.new_session_phrases)
+            else list(defaults.new_session_phrases),
+            bot_name if bot_name is not None else defaults.bot_name,
+        )
+        self.new_session_started_message = (
+            new_session_started_message
+            if new_session_started_message is not None
+            else defaults.new_session_started_message
         )
         self._running = False
         self._mcp_servers = mcp_servers or {}
@@ -481,6 +489,8 @@ class AgentLoop:
             unified_session=defaults.unified_session,
             disabled_skills=defaults.disabled_skills,
             new_session_phrases=defaults.new_session_phrases,
+            bot_name=defaults.bot_name,
+            new_session_started_message=defaults.new_session_started_message,
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
             tools_config=config.tools,
@@ -733,7 +743,8 @@ class AgentLoop:
         ctx = CommandContext(msg=msg, session=None, key=key, raw=raw, loop=self)
         result = await dispatch_fn(ctx)
         if result:
-            await self.bus.publish_outbound(result)
+            if (result.content or "").strip() or result.media or result.buttons:
+                await self.bus.publish_outbound(result)
         else:
             logger.warning("Command '{}' matched but dispatch returned None", raw)
 
@@ -1184,7 +1195,8 @@ class AgentLoop:
                     completed_channel = msg.channel
                     completed_chat_id = msg.chat_id
                     if response is not None:
-                        await self.bus.publish_outbound(response)
+                        if (response.content or "").strip() or response.media or response.buttons:
+                            await self.bus.publish_outbound(response)
                         completed_channel = response.channel
                         completed_chat_id = response.chat_id
                     elif msg.channel == "cli":

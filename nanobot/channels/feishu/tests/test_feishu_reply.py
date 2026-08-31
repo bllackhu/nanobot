@@ -21,6 +21,8 @@ from nanobot.bus.events import INBOUND_META_HISTORY_ONLY, OutboundMessage
 from nanobot.bus.outbound_events import ProgressEvent
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.feishu.runtime import FeishuChannel, FeishuConfig
+from nanobot.command.new_intent import effective_new_session_phrases
+from nanobot.config.schema import AgentDefaults
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,6 +36,8 @@ def _make_feishu_channel(
     group_policy: str = "mention",
     topic_isolation: bool = True,
     listen_emoji: str | object = _LISTEN_EMOJI_UNSET,
+    bot_name: str | None = None,
+    new_session_started_message: str | None = None,
 ) -> FeishuChannel:
     config_kwargs: dict = {
         "enabled": True,
@@ -48,6 +52,16 @@ def _make_feishu_channel(
         config_kwargs["listen_emoji"] = listen_emoji
     config = FeishuConfig(**config_kwargs)
     channel = FeishuChannel(config, MessageBus())
+    defaults = AgentDefaults()
+    channel._new_session_phrases = effective_new_session_phrases(
+        defaults.new_session_phrases,
+        bot_name if bot_name is not None else defaults.bot_name,
+    )
+    channel._new_session_started_message = (
+        new_session_started_message.strip()
+        if new_session_started_message is not None
+        else (defaults.new_session_started_message or "").strip()
+    )
     channel._client = MagicMock()
     # _loop is only used by the WebSocket thread bridge; not needed for unit tests
     channel._loop = None
@@ -664,7 +678,9 @@ async def test_on_message_new_system_divider_only_in_p2p(
     _, receive_id, msg_type, content = channel._send_message_sync.call_args.args
     assert receive_id == "ou_alice"
     assert msg_type == "system"
-    assert json.loads(content)["type"] == "divider"
+    payload = json.loads(content)
+    assert payload["type"] == "divider"
+    assert payload["params"]["divider_text"]["text"] == "New session started."
 
 
 @pytest.mark.parametrize("text", ["新对话", "new", "New Session!"])
@@ -686,33 +702,74 @@ async def test_on_message_new_phrase_system_divider_in_p2p(text: str) -> None:
     _, receive_id, msg_type, content = channel._send_message_sync.call_args.args
     assert receive_id == "ou_alice"
     assert msg_type == "system"
-    assert json.loads(content)["type"] == "divider"
+    payload = json.loads(content)
+    assert payload["type"] == "divider"
+    assert payload["params"]["divider_text"]["text"] == "New session started."
 
 
+@pytest.mark.parametrize("confirm", ["New session started.", "已开启新对话"])
 @pytest.mark.asyncio
-async def test_send_new_session_text_suppressed_in_p2p_only() -> None:
-    p2p = _make_feishu_channel()
+async def test_send_new_session_text_suppressed_in_p2p_only(confirm: str) -> None:
+    p2p = _make_feishu_channel(new_session_started_message=confirm)
     p2p._send_message_sync = MagicMock()
 
     await p2p.send(OutboundMessage(
         channel="feishu",
         chat_id="ou_alice",
-        content="New session started.",
+        content=confirm,
         metadata={"chat_type": "p2p"},
     ))
 
-    group = _make_feishu_channel()
+    group = _make_feishu_channel(new_session_started_message=confirm)
     group._send_message_sync = MagicMock(return_value="om_text")
 
     await group.send(OutboundMessage(
         channel="feishu",
         chat_id="oc_group",
-        content="New session started.",
+        content=confirm,
         metadata={"chat_type": "group"},
     ))
 
     p2p._send_message_sync.assert_not_called()
     assert group._send_message_sync.call_args.args[2] == "text"
+
+
+@pytest.mark.asyncio
+async def test_on_message_empty_started_message_skips_p2p_divider() -> None:
+    channel = _make_feishu_channel(new_session_started_message="")
+    channel._processed_message_ids.clear()
+    channel._send_message_sync = MagicMock(return_value="om_system")
+    channel._handle_message = AsyncMock()
+
+    with patch.object(channel, "_add_reaction", return_value=None):
+        await channel._on_message(_make_feishu_event(
+            chat_type="p2p",
+            content='{"text": "/new"}',
+        ))
+
+    channel._handle_message.assert_awaited_once()
+    channel._send_message_sync.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_on_message_custom_started_message_divider_in_p2p() -> None:
+    channel = _make_feishu_channel(new_session_started_message="已开启新对话")
+    channel._processed_message_ids.clear()
+    channel._send_message_sync = MagicMock(return_value="om_system")
+    channel._handle_message = AsyncMock()
+
+    with patch.object(channel, "_add_reaction", return_value=None):
+        await channel._on_message(_make_feishu_event(
+            chat_type="p2p",
+            content='{"text": "/new"}',
+        ))
+
+    _, receive_id, msg_type, content = channel._send_message_sync.call_args.args
+    assert receive_id == "ou_alice"
+    assert msg_type == "system"
+    payload = json.loads(content)
+    assert payload["type"] == "divider"
+    assert payload["params"]["divider_text"]["text"] == "已开启新对话"
 
 
 @pytest.mark.asyncio
@@ -1440,6 +1497,40 @@ async def test_listen_unmentioned_new_phrase_skips_history_only_and_uses_react_e
     await asyncio.sleep(0)
     channel._add_reaction.assert_awaited_once_with(
         "om_listen_new_phrase", channel.config.react_emoji
+    )
+
+
+@pytest.mark.asyncio
+async def test_listen_unmentioned_bot_name_skips_history_only() -> None:
+    """Under listen, unmentioned 虾宝虾宝 skips history-only when botName is 虾宝."""
+    channel = _make_feishu_channel(group_policy="listen", bot_name="虾宝")
+    channel._bot_open_id = "ou_bot123"
+    bus_spy = []
+    original_publish = channel.bus.publish_inbound
+
+    async def capture(msg):
+        bus_spy.append(msg)
+        await original_publish(msg)
+
+    channel.bus.publish_inbound = capture
+    channel._download_and_save_media = AsyncMock(return_value=(None, ""))
+    channel.transcribe_audio = AsyncMock(return_value="")
+    channel._add_reaction = AsyncMock(return_value=None)
+
+    await channel._on_message(
+        _make_feishu_event(
+            chat_type="group",
+            content='{"text": "虾宝虾宝"}',
+            message_id="om_listen_bot_name",
+        )
+    )
+
+    assert len(bus_spy) == 1
+    assert INBOUND_META_HISTORY_ONLY not in bus_spy[0].metadata
+    assert bus_spy[0].content == "虾宝虾宝"
+    await asyncio.sleep(0)
+    channel._add_reaction.assert_awaited_once_with(
+        "om_listen_bot_name", channel.config.react_emoji
     )
 
 

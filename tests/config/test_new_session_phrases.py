@@ -4,7 +4,11 @@ import json
 import subprocess
 import sys
 
-from nanobot.config.schema import DEFAULT_NEW_SESSION_PHRASES, AgentDefaults
+from nanobot.config.schema import (
+    DEFAULT_NEW_SESSION_PHRASES,
+    DEFAULT_NEW_SESSION_STARTED_MESSAGE,
+    AgentDefaults,
+)
 
 
 def test_new_session_phrases_default_and_alias() -> None:
@@ -23,6 +27,24 @@ def test_new_session_phrases_default_and_alias() -> None:
 
     empty = AgentDefaults.model_validate({"newSessionPhrases": []})
     assert empty.new_session_phrases == []
+
+
+def test_new_session_started_message_default_and_alias() -> None:
+    defaults = AgentDefaults()
+    assert defaults.new_session_started_message == DEFAULT_NEW_SESSION_STARTED_MESSAGE
+    dumped = AgentDefaults().model_dump(by_alias=True)
+    assert dumped["newSessionStartedMessage"] == DEFAULT_NEW_SESSION_STARTED_MESSAGE
+
+    parsed = AgentDefaults.model_validate(
+        json.loads('{"newSessionStartedMessage": "已开启新对话"}')
+    )
+    assert parsed.new_session_started_message == "已开启新对话"
+
+    snake = AgentDefaults.model_validate({"new_session_started_message": "hi"})
+    assert snake.new_session_started_message == "hi"
+
+    empty = AgentDefaults.model_validate({"newSessionStartedMessage": ""})
+    assert empty.new_session_started_message == ""
 
 
 def test_schema_import_does_not_circular_import_agent() -> None:
