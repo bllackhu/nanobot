@@ -50,6 +50,7 @@ from nanobot.bus.runtime_events import (
     ensure_runtime_event_publisher,
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
+from nanobot.command.new_intent import is_new_session_phrase
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
@@ -274,6 +275,7 @@ class AgentLoop:
         hook_factories: list[AgentTurnHookFactory] | None = None,
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
+        new_session_phrases: list[str] | None = None,
         tools_config: ToolsConfig | None = None,
         image_generation_provider_config: ProviderConfig | None = None,
         image_generation_provider_configs: dict[str, ProviderConfig] | None = None,
@@ -372,6 +374,11 @@ class AgentLoop:
             llm_wall_timeout_for_session=lambda sk: runner_wall_llm_timeout_s(self.sessions, sk),
         )
         self._unified_session = unified_session
+        self.new_session_phrases = (
+            list(new_session_phrases)
+            if new_session_phrases is not None
+            else list(defaults.new_session_phrases)
+        )
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stacks: dict[str, MCPConnection] = {}
@@ -473,6 +480,7 @@ class AgentLoop:
             timezone=defaults.timezone,
             unified_session=defaults.unified_session,
             disabled_skills=defaults.disabled_skills,
+            new_session_phrases=defaults.new_session_phrases,
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
             tools_config=config.tools,
@@ -748,6 +756,13 @@ class AgentLoop:
             return UNIFIED_SESSION_KEY
         return msg.session_key
 
+    def _canonicalize_new_session_message(self, msg: InboundMessage) -> InboundMessage:
+        """Rewrite configured whole-message /new aliases to the slash command."""
+        raw = msg.content.strip() if isinstance(msg.content, str) else ""
+        if is_new_session_phrase(raw, self.new_session_phrases):
+            return dataclasses.replace(msg, content="/new")
+        return msg
+
     @staticmethod
     def _replay_token_budget(runtime: LLMRuntime) -> int:
         """Derive a token budget for session history replay from the context window."""
@@ -1009,6 +1024,7 @@ class AgentLoop:
                     logger.warning("Error consuming inbound message: {}, continuing...", e)
                     continue
 
+                msg = self._canonicalize_new_session_message(msg)
                 raw = msg.content.strip()
                 effective_key = self._effective_session_key(msg)
                 if await agent_context.handle_runtime_control(self, msg, self.tools):
@@ -1099,6 +1115,7 @@ class AgentLoop:
         session_key = self._effective_session_key(msg)
         if session_key != msg.session_key:
             msg = dataclasses.replace(msg, session_key_override=session_key)
+        msg = self._canonicalize_new_session_message(msg)
         lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         gate = self._concurrency_gate or nullcontext()
 

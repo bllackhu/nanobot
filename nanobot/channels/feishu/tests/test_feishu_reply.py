@@ -667,6 +667,28 @@ async def test_on_message_new_system_divider_only_in_p2p(
     assert json.loads(content)["type"] == "divider"
 
 
+@pytest.mark.parametrize("text", ["新对话", "new", "New Session!"])
+@pytest.mark.asyncio
+async def test_on_message_new_phrase_system_divider_in_p2p(text: str) -> None:
+    channel = _make_feishu_channel(group_policy="mention")
+    channel._processed_message_ids.clear()
+    channel._send_message_sync = MagicMock(return_value="om_system")
+    channel._handle_message = AsyncMock()
+
+    with patch.object(channel, "_add_reaction", return_value=None):
+        await channel._on_message(_make_feishu_event(
+            chat_type="p2p",
+            content=json.dumps({"text": text}),
+        ))
+
+    channel._handle_message.assert_awaited_once()
+    assert channel._handle_message.call_args.kwargs["content"] == text
+    _, receive_id, msg_type, content = channel._send_message_sync.call_args.args
+    assert receive_id == "ou_alice"
+    assert msg_type == "system"
+    assert json.loads(content)["type"] == "divider"
+
+
 @pytest.mark.asyncio
 async def test_send_new_session_text_suppressed_in_p2p_only() -> None:
     p2p = _make_feishu_channel()
@@ -1385,6 +1407,40 @@ async def test_listen_unmentioned_slash_new_skips_history_only_and_uses_react_em
     assert bus_spy[0].content == "/new"
     await asyncio.sleep(0)
     channel._add_reaction.assert_awaited_once_with("om_listen_new", channel.config.react_emoji)
+
+
+@pytest.mark.asyncio
+async def test_listen_unmentioned_new_phrase_skips_history_only_and_uses_react_emoji() -> None:
+    """Under listen, unmentioned 新对话 is a normal command turn (no Pin / HISTORY_ONLY)."""
+    channel = _make_feishu_channel(group_policy="listen")
+    channel._bot_open_id = "ou_bot123"
+    bus_spy = []
+    original_publish = channel.bus.publish_inbound
+
+    async def capture(msg):
+        bus_spy.append(msg)
+        await original_publish(msg)
+
+    channel.bus.publish_inbound = capture
+    channel._download_and_save_media = AsyncMock(return_value=(None, ""))
+    channel.transcribe_audio = AsyncMock(return_value="")
+    channel._add_reaction = AsyncMock(return_value=None)
+
+    await channel._on_message(
+        _make_feishu_event(
+            chat_type="group",
+            content='{"text": "新对话"}',
+            message_id="om_listen_new_phrase",
+        )
+    )
+
+    assert len(bus_spy) == 1
+    assert INBOUND_META_HISTORY_ONLY not in bus_spy[0].metadata
+    assert bus_spy[0].content == "新对话"
+    await asyncio.sleep(0)
+    channel._add_reaction.assert_awaited_once_with(
+        "om_listen_new_phrase", channel.config.react_emoji
+    )
 
 
 @pytest.mark.asyncio

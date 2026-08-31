@@ -27,6 +27,8 @@ These commands work inside chat channels and interactive agent sessions:
 | `/pairing revoke <channel> <user_id>` | Revoke a previously approved user on a specific channel |
 | `/help` | Show available in-chat commands |
 
+Whole-message aliases for `/new` can also start a fresh session. By default these are `新对话`, `新会话`, `新任务`, `new`, `new chat`, and `new session` (case-insensitive; optional trailing `。.!！？?`). The entire message must equal one of those phrases — `新对话，帮我写周报` is a normal chat turn. Configure or disable them with [`agents.defaults.newSessionPhrases`](./configuration.md#new-session-phrases).
+
 ## Pairing
 
 When someone sends a DM to the bot and isn't on the allowlist — whether it's a new user or an existing user on a new channel — nanobot automatically replies with a **pairing code** (like `ABCD-EFGH`) that expires in 10 minutes. To grant them access:

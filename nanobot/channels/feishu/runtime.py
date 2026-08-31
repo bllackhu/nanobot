@@ -38,7 +38,7 @@ from nanobot.channels.feishu.instances import (
 )
 from nanobot.channels.feishu.websocket import get_feishu_ws_runner
 from nanobot.command import CommandRouter, register_builtin_commands
-from nanobot.command.router import normalize_command_text
+from nanobot.command.new_intent import DEFAULT_NEW_SESSION_PHRASES, is_new_session_trigger
 from nanobot.config.paths import get_media_dir
 from nanobot.pairing import clear_channel
 from nanobot.utils.helpers import safe_filename
@@ -2668,8 +2668,12 @@ class FeishuChannel(BaseChannel):
             if not content and not media_paths:
                 return
 
-            # Known slash commands under listen skip history-only (run immediately).
-            if history_only and _LISTEN_CMD_PROBE.is_known_command(content):
+            # Known slash commands (and /new phrase aliases) under listen skip
+            # history-only (run immediately).
+            if history_only and (
+                _LISTEN_CMD_PROBE.is_known_command(content)
+                or is_new_session_trigger(content, DEFAULT_NEW_SESSION_PHRASES)
+            ):
                 history_only = False
 
             # Add reaction (non-blocking — tracked background task).
@@ -2691,7 +2695,9 @@ class FeishuChannel(BaseChannel):
                 task.add_done_callback(self._on_background_task_done)
                 task.add_done_callback(lambda t: self._on_reaction_added(message_id, t))
 
-            if chat_type == "p2p" and normalize_command_text(content).lower() == "/new":
+            if chat_type == "p2p" and is_new_session_trigger(
+                content, DEFAULT_NEW_SESSION_PHRASES
+            ):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     None,
