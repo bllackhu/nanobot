@@ -170,6 +170,9 @@ async def test_consolidation_continues_below_trigger_until_half_target(tmp_path,
 async def test_consolidation_persists_summary_for_next_prepare_session(tmp_path, monkeypatch) -> None:
     loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
     loop.consolidator.archive = AsyncMock(return_value="User discussed project status.")  # type: ignore[method-assign]
+    loop.consolidator.refresh_working_recap = AsyncMock(  # type: ignore[method-assign]
+        return_value="## Goal\nDiscuss project status"
+    )
 
     session = loop.sessions.get_or_create("cli:test")
     session.messages = [
@@ -198,11 +201,11 @@ async def test_consolidation_persists_summary_for_next_prepare_session(tmp_path,
     reloaded = loop.sessions.get_or_create("cli:test")
     meta = reloaded.metadata.get("_last_summary")
     assert meta is not None
-    assert meta["text"] == "User discussed project status."
+    assert meta["text"] == "## Goal\nDiscuss project status"
 
     reloaded, pending = loop.auto_compact.prepare_session(reloaded, "cli:test")
     assert pending is not None
-    assert "User discussed project status." in pending
+    assert "Discuss project status" in pending
     # _last_summary persists for restart survival.
     assert "_last_summary" in reloaded.metadata
 
@@ -275,3 +278,56 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
     assert "llm" in order
     assert order.index("consolidate") < order.index("llm")
     assert archived_session_keys == ["cli:test"]
+
+
+@pytest.mark.asyncio
+async def test_same_turn_injects_working_recap_into_system_prompt(tmp_path, monkeypatch) -> None:
+    """The turn that hides messages must inject the new checkpoint, not SNIP."""
+    loop = _make_loop(tmp_path, estimated_tokens=0, context_window_tokens=200)
+    snip = "- [durable] User prefers Chinese"
+    recap = "## Goal\nFinish the Feishu card\n## Next Steps\n1. Test the divider"
+    agent_systems: list[str] = []
+
+    async def chat_side_effect(*args, **kwargs):
+        messages = kwargs.get("messages") or []
+        system = messages[0]["content"] if messages else ""
+        if "SNIP" in system:
+            return LLMResponse(content=snip, tool_calls=[])
+        if "structured session checkpoint" in system.lower():
+            return LLMResponse(content=recap, tool_calls=[])
+        agent_systems.append(system)
+        return LLMResponse(content="ok", tool_calls=[])
+
+    loop.provider.chat_with_retry = chat_side_effect
+    loop.provider.chat_stream_with_retry = chat_side_effect
+    loop._schedule_background = lambda coro: coro.close()  # type: ignore[method-assign]
+
+    session = loop.sessions.get_or_create("cli:test")
+    session.messages = [
+        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
+        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
+        {"role": "user", "content": "u2", "timestamp": "2026-01-01T00:00:02"},
+    ]
+    loop.sessions.save(session)
+    monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 500)
+
+    call_count = [0]
+
+    def mock_estimate(_session, *, runtime):
+        call_count[0] += 1
+        return (1000 if call_count[0] <= 1 else 80, "test")
+
+    loop.consolidator.estimate_session_prompt_tokens = mock_estimate  # type: ignore[method-assign]
+
+    await loop.process_direct("hello", session_key="cli:test")
+
+    assert agent_systems, "expected an agent turn after consolidation"
+    system = agent_systems[0]
+    assert "[Session Checkpoint]" in system
+    checkpoint = system.split("[Session Checkpoint]", 1)[1]
+    assert "Finish the Feishu card" in checkpoint
+    assert snip not in checkpoint
+    meta = loop.sessions.get_or_create("cli:test").metadata.get("_last_summary")
+    assert meta is not None
+    assert meta["text"] == recap
+
