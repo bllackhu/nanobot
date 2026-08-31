@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from pydantic import AliasChoices, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
+from nanobot.command.new_intent import DEFAULT_NEW_SESSION_PHRASES
 from nanobot.config_base import Base
 from nanobot.cron.types import CronSchedule
 
@@ -153,6 +154,11 @@ class AgentDefaults(Base):
     bot_icon: str = "🐈"  # Short icon (emoji or text) shown next to the bot name in CLI; "" to omit
     unified_session: bool = False  # Share one session across all channels (single-user multi-device)
     disabled_skills: list[str] = Field(default_factory=list)  # Skill names to exclude from loading (e.g. ["summarize", "skill-creator"])
+    new_session_phrases: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_NEW_SESSION_PHRASES),
+        validation_alias=AliasChoices("newSessionPhrases", "new_session_phrases"),
+        serialization_alias="newSessionPhrases",
+    )  # Whole-message aliases for /new; empty list disables
     session_ttl_minutes: int = Field(
         default=15,
         ge=0,

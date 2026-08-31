@@ -47,7 +47,7 @@ the focused guides first and come back here for exact fields and defaults.
 | Add MCP servers | [MCP](#mcp-model-context-protocol) |
 | Review shell, workspace, and SSRF controls | [Security](#security) |
 | Control access and pairing | [Pairing](#pairing) |
-| Tune gateway jobs, sessions, and tools | [Gateway Heartbeat](#gateway-heartbeat), [Auto Compact](#auto-compact), [Unified Session](#unified-session), [Tool Hint Max Length](#tool-hint-max-length) |
+| Tune gateway jobs, sessions, and tools | [Gateway Heartbeat](#gateway-heartbeat), [Auto Compact](#auto-compact), [Unified Session](#unified-session), [New session phrases](#new-session-phrases), [Tool Hint Max Length](#tool-hint-max-length) |
 
 ## Where a Setting Lives
 
@@ -2148,6 +2148,26 @@ When enabled, all incoming messages — regardless of which channel they arrive 
 | Existing `session_key_override` (e.g. Telegram thread) | Respected | Still respected — not overwritten |
 
 > This is designed for single-user, multi-device setups. It is **off by default** — existing users see zero behavior change.
+
+## New session phrases
+
+Users can start a fresh session without typing `/new` by sending a **whole-message** alias such as `新对话` or `new`. Matching runs the same archive-and-clear path as `/new`.
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "newSessionPhrases": ["新对话", "新会话", "新任务", "new", "new chat", "new session"]
+    }
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `agents.defaults.newSessionPhrases` | `["新对话", "新会话", "新任务", "new", "new chat", "new session"]` | Exact whole-message aliases for `/new`. Matching ignores surrounding whitespace, English case, and one trailing `。.!！？?`. Set to `[]` to disable aliases (`/new` still works). |
+
+A longer sentence that merely contains a phrase (`new laptop`, `新对话，帮我写周报`) does not reset the session.
 
 ## Disabled Skills
 
