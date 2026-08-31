@@ -249,7 +249,8 @@ class TestBuildSystemPrompt:
         builder = _builder(tmp_path)
         result = builder.build_system_prompt(session_summary="Previous chat about Python.")
         assert "Previous chat about Python." in result
-        assert "[Archived Context Summary]" in result
+        assert "[Session Checkpoint]" in result
+        assert "established background" in result
 
     def test_sections_separated_by_separator(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Rules.", encoding="utf-8")
@@ -261,7 +262,7 @@ class TestBuildSystemPrompt:
         builder = _builder(tmp_path)
         result = builder.build_system_prompt()
         assert "## AGENTS.md" not in result
-        assert "[Archived Context Summary]" not in result
+        assert "[Session Checkpoint]" not in result
 
 
 # ---------------------------------------------------------------------------

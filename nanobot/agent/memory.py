@@ -39,6 +39,21 @@ from nanobot.utils.workspace_prompts import (
 if TYPE_CHECKING:
     from nanobot.utils.llm_runtime import LLMRuntime
 
+# Individual history.jsonl writers cap their own payloads tightly; the
+# _HISTORY_ENTRY_HARD_CAP at append_history() is a belt-and-suspenders default
+# that catches any new caller that forgot to set its own cap.
+_RAW_ARCHIVE_MAX_CHARS = 16_000       # fallback dump (LLM failed)
+_ARCHIVE_SUMMARY_MAX_CHARS = 8_000    # LLM-produced consolidation summary
+_HISTORY_ENTRY_HARD_CAP = 64_000      # emergency cap in append_history
+_TOOL_RESULT_MAX_CHARS = 2_000        # summarizer input only; session JSON stays full
+_WORKING_RECAP_MAX_CHARS = 4_000      # session checkpoint stored in _last_summary
+_RECAP_TRIM_SECTIONS = (
+    "Progress",
+    "Next Steps",
+    "Key Decisions",
+    "Constraints and Preferences",
+)
+
 # ---------------------------------------------------------------------------
 # MemoryStore — pure file I/O layer
 # ---------------------------------------------------------------------------
@@ -641,14 +656,31 @@ class MemoryStore:
     # -- message formatting utility ------------------------------------------
 
     @staticmethod
-    def _format_messages(messages: list[dict]) -> str:
+    def _truncate_tool_result_content(content: Any, max_chars: int) -> str:
+        text = content if isinstance(content, str) else str(content)
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
+        extra = len(text) - max_chars
+        return f"{text[:max_chars]}\n[... truncated {extra} chars]"
+
+    @staticmethod
+    def _format_messages(
+        messages: list[dict],
+        *,
+        tool_result_max_chars: int = _TOOL_RESULT_MAX_CHARS,
+    ) -> str:
         lines = []
         for message in messages:
-            if not message.get("content"):
+            content = message.get("content")
+            if not content:
                 continue
+            if message.get("role") == "tool":
+                content = MemoryStore._truncate_tool_result_content(
+                    content, tool_result_max_chars
+                )
             tools = f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
             lines.append(
-                f"[{message.get('timestamp', '?')[:16]}] {message['role'].upper()}{tools}: {message['content']}"
+                f"[{message.get('timestamp', '?')[:16]}] {message['role'].upper()}{tools}: {content}"
             )
         return "\n".join(lines)
 
@@ -729,13 +761,6 @@ class MemoryStore:
 # ---------------------------------------------------------------------------
 # Consolidator — lightweight token-budget triggered consolidation
 # ---------------------------------------------------------------------------
-
-# Individual history.jsonl writers cap their own payloads tightly; the
-# _HISTORY_ENTRY_HARD_CAP at append_history() is a belt-and-suspenders default
-# that catches any new caller that forgot to set its own cap.
-_RAW_ARCHIVE_MAX_CHARS = 16_000       # fallback dump (LLM failed)
-_ARCHIVE_SUMMARY_MAX_CHARS = 8_000    # LLM-produced consolidation summary
-_HISTORY_ENTRY_HARD_CAP = 64_000      # emergency cap in append_history
 
 
 class Consolidator:
@@ -869,12 +894,180 @@ class Consolidator:
         return summary
 
     def _persist_last_summary(self, session: Session, summary: str | None) -> None:
-        if summary and summary != "(nothing)":
+        text = self._usable_summary_text(summary)
+        if text:
             session.metadata["_last_summary"] = {
-                "text": summary,
+                "text": text,
                 "last_active": session.updated_at.isoformat(),
             }
             self.sessions.save(session)
+
+    @staticmethod
+    def _usable_summary_text(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        if not text or text == "(nothing)":
+            return None
+        return value
+
+    @staticmethod
+    def _checkpoint_text(session: Session) -> str | None:
+        meta = getattr(session, "metadata", None)
+        if not isinstance(meta, dict):
+            return None
+        block = meta.get("_last_summary")
+        if not isinstance(block, dict):
+            return None
+        text = block.get("text")
+        if isinstance(text, str) and text.strip() and text.strip() != "(nothing)":
+            return text
+        return None
+
+    @staticmethod
+    def _split_markdown_sections(text: str) -> list[tuple[str, str]]:
+        sections: list[tuple[str, str]] = []
+        current_title = ""
+        current_lines: list[str] = []
+        for line in text.splitlines():
+            if line.startswith("## "):
+                if current_title or current_lines:
+                    sections.append((current_title, "\n".join(current_lines).strip("\n")))
+                current_title = line[3:].strip()
+                current_lines = []
+            else:
+                current_lines.append(line)
+        if current_title or current_lines:
+            sections.append((current_title, "\n".join(current_lines).strip("\n")))
+        return sections
+
+    @classmethod
+    def _cap_working_recap(cls, text: str, max_chars: int = _WORKING_RECAP_MAX_CHARS) -> str:
+        text = text.strip()
+        if len(text) <= max_chars:
+            return text
+        sections = cls._split_markdown_sections(text)
+        if not sections:
+            return truncate_text(text, max_chars)
+        bodies = {title: body for title, body in sections}
+
+        def _render() -> str:
+            parts: list[str] = []
+            for title, body in sections:
+                chunk = bodies.get(title, body)
+                if title:
+                    parts.append(f"## {title}" + (f"\n{chunk}" if chunk else ""))
+                elif chunk:
+                    parts.append(chunk)
+            return "\n\n".join(parts).strip()
+
+        rendered = _render()
+        for title in _RECAP_TRIM_SECTIONS:
+            if title not in bodies or len(rendered) <= max_chars:
+                break
+            overflow = len(rendered) - max_chars
+            if overflow >= len(bodies[title]):
+                bodies[title] = ""
+            else:
+                bodies[title] = bodies[title][: len(bodies[title]) - overflow].rstrip()
+            rendered = _render()
+        if len(rendered) > max_chars:
+            return truncate_text(rendered, max_chars)
+        return rendered
+
+    def _format_hidden_messages(self, messages: list[dict]) -> str:
+        return MemoryStore._format_messages(
+            public_history_messages(messages),
+            tool_result_max_chars=_TOOL_RESULT_MAX_CHARS,
+        )
+
+    async def refresh_working_recap(
+        self,
+        messages: list[dict],
+        *,
+        runtime: LLMRuntime,
+        previous_checkpoint: str | None = None,
+    ) -> str | None:
+        """Build a working session checkpoint for the hidden message span.
+
+        Returns the checkpoint text on success, or None if the LLM fails.
+        Does not write history.jsonl — that remains the SNIP archive path.
+        """
+        if not messages:
+            return None
+        formatted = self._format_hidden_messages(messages)
+        formatted = self._truncate_to_token_budget(formatted, runtime=runtime)
+        parts = []
+        if previous_checkpoint:
+            parts.append(
+                "<previous-checkpoint>\n"
+                f"{previous_checkpoint}\n"
+                "</previous-checkpoint>\n"
+            )
+        parts.append(formatted)
+        try:
+            response = await runtime.provider.chat_with_retry(
+                model=runtime.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": render_template(
+                            "agent/consolidator_working_recap.md",
+                            strip=True,
+                        ),
+                    },
+                    {"role": "user", "content": "\n".join(parts)},
+                ],
+                tools=None,
+                tool_choice=None,
+                temperature=runtime.generation.temperature,
+                max_tokens=runtime.generation.max_tokens,
+                reasoning_effort=runtime.generation.reasoning_effort,
+            )
+            if response.finish_reason == "error":
+                raise RuntimeError(f"LLM returned error: {response.content}")
+            summary = response.content
+            if not isinstance(summary, str) or not summary.strip():
+                raise RuntimeError("working recap returned empty content")
+            if summary.strip() == "(nothing)":
+                return None
+            return self._cap_working_recap(summary)
+        except Exception:
+            logger.warning("Working recap LLM call failed; keeping previous checkpoint")
+            return None
+
+    async def _apply_working_recap(
+        self,
+        session: Session,
+        hidden: list[dict],
+        *,
+        runtime: LLMRuntime,
+        snip_fallback: str | None = None,
+    ) -> str | None:
+        """Persist a working checkpoint after messages were hidden.
+
+        Prefers a fresh recap. On recap failure, keep the previous checkpoint;
+        if none exists, fall back to a truncated SNIP string so the slot is not empty.
+        """
+        if not hidden:
+            return self._checkpoint_text(session)
+        previous = self._checkpoint_text(session)
+        recap = await self.refresh_working_recap(
+            hidden,
+            runtime=runtime,
+            previous_checkpoint=previous,
+        )
+        if recap:
+            self._persist_last_summary(session, recap)
+            return recap
+        if previous:
+            return previous
+        snip_text = self._usable_summary_text(snip_fallback)
+        if snip_text:
+            capped = truncate_text(snip_text, _WORKING_RECAP_MAX_CHARS)
+            self._persist_last_summary(session, capped)
+            return capped
+        return None
 
     def estimate_session_prompt_tokens(
         self,
@@ -1004,7 +1197,8 @@ class Consolidator:
 
             budget = self._input_token_budget(runtime)
             target = int(budget * self.consolidation_ratio)
-            last_summary = await self._consolidate_replay_overflow(
+            old_cursor = session.last_consolidated
+            last_snip = await self._consolidate_replay_overflow(
                 session,
                 replay_max_messages,
                 runtime=runtime,
@@ -1018,7 +1212,10 @@ class Consolidator:
                 logger.exception("Token estimation failed for {}", session.key)
                 estimated, source = 0, "error"
             if estimated <= 0:
-                self._persist_last_summary(session, last_summary)
+                hidden = session.messages[old_cursor:session.last_consolidated]
+                await self._apply_working_recap(
+                    session, hidden, runtime=runtime, snip_fallback=last_snip,
+                )
                 return
             if estimated < budget:
                 unconsolidated_count = len(session.messages) - session.last_consolidated
@@ -1030,7 +1227,10 @@ class Consolidator:
                     source,
                     unconsolidated_count,
                 )
-                self._persist_last_summary(session, last_summary)
+                hidden = session.messages[old_cursor:session.last_consolidated]
+                await self._apply_working_recap(
+                    session, hidden, runtime=runtime, snip_fallback=last_snip,
+                )
                 return
 
             rounds_done = 0
@@ -1078,7 +1278,7 @@ class Consolidator:
                 # a breadcrumb. Re-archiving the same chunk on the next call
                 # would just emit duplicate [RAW] entries.
                 if summary:
-                    last_summary = summary
+                    last_snip = summary
                     rounds_done += 1
                 session.last_consolidated = end_idx
                 self.sessions.save(session)
@@ -1101,10 +1301,10 @@ class Consolidator:
             if rounds_done and self._on_status is not None:
                 await self._on_status(session.key, "history consolidated")
 
-            # Persist the last summary to session metadata so it can be injected
-            # into the runtime context on the next prepare_session() call, aligning
-            # the summary injection strategy with AutoCompact._archive().
-            self._persist_last_summary(session, last_summary)
+            hidden = session.messages[old_cursor:session.last_consolidated]
+            await self._apply_working_recap(
+                session, hidden, runtime=runtime, snip_fallback=last_snip,
+            )
 
     async def compact_idle_session(
         self,
@@ -1147,20 +1347,39 @@ class Consolidator:
                 return ""
 
             last_active = session.updated_at
-            summary: str | None = ""
+            previous = self._checkpoint_text(session)
+            snip: str | None = ""
+            recap: str | None = None
             if messages_to_remove:
-                # Summarize the retained suffix too, but only remove/raw-dump
-                # the messages that are no longer kept in the live session.
-                summary = await self.archive(
+                # SNIP over the full unconsolidated tail (including the kept
+                # suffix) so Dream still sees late corrections. Recap only the
+                # dropped prefix — the suffix stays in live messages.
+                snip = await self.archive(
                     messages_to_remove,
                     runtime=runtime,
                     session_key=session_key,
                     summary_messages=messages_to_summarize,
                 )
+                recap = await self.refresh_working_recap(
+                    messages_to_remove,
+                    runtime=runtime,
+                    previous_checkpoint=previous,
+                )
 
-            if summary and summary != "(nothing)":
+            snip_text = self._usable_summary_text(snip)
+            if recap:
                 session.metadata["_last_summary"] = {
-                    "text": summary,
+                    "text": recap,
+                    "last_active": last_active.isoformat(),
+                }
+            elif previous:
+                session.metadata["_last_summary"] = {
+                    "text": previous,
+                    "last_active": last_active.isoformat(),
+                }
+            elif snip_text:
+                session.metadata["_last_summary"] = {
+                    "text": truncate_text(snip_text, _WORKING_RECAP_MAX_CHARS),
                     "last_active": last_active.isoformat(),
                 }
 
@@ -1170,11 +1389,17 @@ class Consolidator:
 
             if messages_to_remove:
                 logger.info(
-                    "Idle-session compact for {}: archived={}, kept={}, summary={}",
+                    "Idle-session compact for {}: archived={}, kept={}, recap={}",
                     session_key,
                     len(messages_to_remove),
                     len(messages_to_keep),
-                    bool(summary),
+                    bool(recap or previous or snip_text),
                 )
 
-            return summary
+            if recap:
+                return recap
+            if previous:
+                return previous
+            if snip_text:
+                return truncate_text(snip_text, _WORKING_RECAP_MAX_CHARS)
+            return snip

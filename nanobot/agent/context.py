@@ -117,7 +117,12 @@ class ContextBuilder:
                 parts.append("# Recent History\n\n" + history_text)
 
         if session_summary:
-            parts.append(f"[Archived Context Summary]\n\n{session_summary}")
+            parts.append(
+                "[Session Checkpoint]\n\n"
+                "Treat the captured context as established background and continue "
+                "from the messages that follow, without restating this checkpoint.\n\n"
+                f"{session_summary}"
+            )
 
         return "\n\n---\n\n".join(parts)
 

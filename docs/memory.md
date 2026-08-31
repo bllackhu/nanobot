@@ -31,7 +31,10 @@ Memory moves through nanobot in two stages.
 
 When a conversation grows large enough to pressure the context window, nanobot does not try to carry every old message forever.
 
-Instead, the `Consolidator` summarizes the oldest safe slice of the conversation and appends that summary to `memory/history.jsonl`.
+Instead, the `Consolidator` hides the oldest safe slice of the conversation behind `last_consolidated` and makes two LLM calls:
+
+1. **SNIP archive** — tagged long-term facts appended to `memory/history.jsonl` for Dream.
+2. **Working recap** — a session checkpoint (goal, progress, next steps, critical context) stored in session metadata and injected as `[Session Checkpoint]` on the same turn, alongside the verbatim unconsolidated tail.
 
 This file is:
 

@@ -1969,6 +1969,13 @@ class AgentLoop:
                 runtime=ctx.runtime,
                 replay_max_messages=replay_max_messages,
             )
+            # Consolidation may have replaced the in-memory session and/or
+            # written a fresh checkpoint after hiding turns. COMPACT captured
+            # pending_summary before that work.
+            ctx.session = self.sessions.get_or_create(ctx.session_key)
+            fresh = AutoCompact.summary_from_session(ctx.session)
+            if fresh:
+                ctx.pending_summary = fresh
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()

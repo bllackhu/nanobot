@@ -5,8 +5,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import nanobot.agent.memory as memory_module
 from nanobot.agent.memory import (
     _ARCHIVE_SUMMARY_MAX_CHARS,
+    _TOOL_RESULT_MAX_CHARS,
     Consolidator,
     MemoryStore,
 )
@@ -19,6 +21,14 @@ from nanobot.runtime_context import (
 from nanobot.session.manager import Session
 from nanobot.utils.llm_runtime import LLMRuntime
 from nanobot.utils.prompt_templates import render_template
+
+
+def _llm_call_for_prompt(mock, needle: str):
+    for call in mock.chat_with_retry.call_args_list:
+        messages = call.kwargs.get("messages") or []
+        if messages and needle in (messages[0].get("content") or ""):
+            return call
+    raise AssertionError(f"no LLM call whose system prompt contains {needle!r}")
 
 
 @pytest.fixture
@@ -215,6 +225,19 @@ class TestConsolidatorPromptContract:
             assert mark in prompt
         assert "check context below" not in prompt.lower()
         assert "Do not mark something [skip] merely because it might already exist" in prompt
+
+
+class TestWorkingRecapPromptContract:
+    def test_recap_prompt_is_checkpoint_not_snip(self):
+        prompt = render_template("agent/consolidator_working_recap.md", strip=True)
+        assert "session checkpoint" in prompt.lower()
+        assert "## Goal" in prompt
+        assert "## Next Steps" in prompt
+        assert "## Critical Context" in prompt
+        assert "SNIP" not in prompt
+        assert "[permanent]" not in prompt
+        assert "[durable]" not in prompt
+        assert "<previous-checkpoint>" in prompt
 
 
 class TestConsolidatorArchiveErrorHandling:
@@ -675,7 +698,7 @@ class TestCompactIdleSession:
             "cli:correction", runtime=runtime, max_suffix=8
         )
 
-        summarized = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+        summarized = _llm_call_for_prompt(mock_provider, "SNIP").kwargs["messages"][1]["content"]
         assert "CORRECTED_FINAL_RESULT_alpha" in summarized
 
     @pytest.mark.asyncio
@@ -822,7 +845,7 @@ class TestCompactIdleSession:
 
         # Verify only the unconsolidated tail was processed:
         # 10 unconsolidated messages (50-59), keep suffix of 4 → archive 6
-        archived_call = mock_provider.chat_with_retry.call_args
+        archived_call = _llm_call_for_prompt(mock_provider, "SNIP")
         user_content = archived_call.kwargs["messages"][1]["content"]
         # Should contain only tail messages, not early ones
         assert "u0" not in user_content
@@ -868,10 +891,11 @@ class TestCompactIdleSession:
             "assistant-09",
         ]
 
-        # #4264: idle compaction now summarizes the full unconsolidated tail, so
+        # #4264: idle compaction SNIP-summarizes the full unconsolidated tail, so
         # the dropped head (user-00) and retained suffix (user-14 through
-        # assistant-09) are all summarized.
-        archived_call = mock_provider.chat_with_retry.call_args
+        # assistant-09) are all in the archive call. The working recap only
+        # sees the dropped prefix.
+        archived_call = _llm_call_for_prompt(mock_provider, "SNIP")
         user_content = archived_call.kwargs["messages"][1]["content"]
         assert "user-00" in user_content
         assert "assistant-09" in user_content
@@ -1147,3 +1171,279 @@ class TestArchiveTruncation:
         sent_content = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
         token_count = len(enc.encode(sent_content))
         assert token_count <= 9_900
+
+
+class TestWorkingRecap:
+    async def test_refresh_working_recap_writes_checkpoint_not_snip(
+        self, consolidator, mock_provider, runtime, monkeypatch
+    ):
+        monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 150)
+        snip = "- [durable] User prefers Chinese"
+        recap = "## Goal\nShip the Feishu card\n## Next Steps\n1. Test the divider"
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content=snip, finish_reason="stop"),
+            MagicMock(content=recap, finish_reason="stop"),
+        ]
+        session = Session(key="cli:recap")
+        session.messages = [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "u3"},
+        ]
+        session.metadata = {}
+        consolidator.sessions._session_cache[session.key] = session
+        consolidator._SAFETY_BUFFER = 0
+        consolidator.estimate_session_prompt_tokens = MagicMock(
+            side_effect=[(1200, "tiktoken"), (80, "tiktoken")]
+        )
+
+        await consolidator.maybe_consolidate_by_tokens(session, runtime=runtime)
+
+        entries = consolidator.store.read_unprocessed_history(since_cursor=0)
+        assert any(snip in e["content"] for e in entries)
+        assert session.metadata["_last_summary"]["text"] == recap
+        assert snip not in session.metadata["_last_summary"]["text"]
+        assert mock_provider.chat_with_retry.await_count == 2
+
+    async def test_recap_called_once_across_multiple_archive_rounds(
+        self, consolidator, mock_provider, runtime, monkeypatch
+    ):
+        monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 100)
+        recap = "## Goal\nKeep going"
+        archive_round = [0]
+
+        async def chat_side_effect(*args, **kwargs):
+            system = (kwargs.get("messages") or [{}])[0].get("content") or ""
+            if "structured session checkpoint" in system.lower():
+                return MagicMock(content=recap, finish_reason="stop")
+            archive_round[0] += 1
+            return MagicMock(
+                content=f"- [skip] round{archive_round[0]}",
+                finish_reason="stop",
+            )
+
+        mock_provider.chat_with_retry.side_effect = chat_side_effect
+        session = Session(key="cli:rounds")
+        session.messages = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"}
+            for i in range(8)
+        ]
+        session.metadata = {}
+        consolidator.sessions._session_cache[session.key] = session
+        consolidator._SAFETY_BUFFER = 0
+
+        call_count = [0]
+
+        def mock_estimate(_session, *, runtime):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (1000, "test")
+            if call_count[0] == 2:
+                return (600, "test")
+            return (80, "test")
+
+        consolidator.estimate_session_prompt_tokens = mock_estimate
+        consolidator.consolidation_ratio = 0.5
+
+        await consolidator.maybe_consolidate_by_tokens(session, runtime=runtime)
+
+        recap_calls = [
+            c for c in mock_provider.chat_with_retry.call_args_list
+            if "session checkpoint" in (c.kwargs["messages"][0]["content"] or "").lower()
+        ]
+        assert len(recap_calls) == 1
+        assert archive_round[0] >= 1
+        assert session.metadata["_last_summary"]["text"] == recap
+
+    async def test_recap_failure_keeps_previous_checkpoint(
+        self, consolidator, mock_provider, runtime, monkeypatch
+    ):
+        monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 150)
+        session = Session(key="cli:keep")
+        session.messages = [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+        ]
+        session.metadata = {
+            "_last_summary": {
+                "text": "## Goal\nPrevious work",
+                "last_active": session.updated_at.isoformat(),
+            }
+        }
+        consolidator.sessions._session_cache[session.key] = session
+        consolidator._SAFETY_BUFFER = 0
+        consolidator.estimate_session_prompt_tokens = MagicMock(
+            side_effect=[(1200, "tiktoken"), (80, "tiktoken")]
+        )
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="- [durable] a fact", finish_reason="stop"),
+            RuntimeError("recap failed"),
+        ]
+
+        await consolidator.maybe_consolidate_by_tokens(session, runtime=runtime)
+
+        assert session.last_consolidated > 0
+        assert session.metadata["_last_summary"]["text"] == "## Goal\nPrevious work"
+        entries = consolidator.store.read_unprocessed_history(since_cursor=0)
+        assert any("[durable]" in e["content"] for e in entries)
+
+    async def test_recap_failure_falls_back_to_snip_when_no_previous(
+        self, consolidator, mock_provider, runtime, monkeypatch
+    ):
+        monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 150)
+        snip = "- [durable] Only fact"
+        session = Session(key="cli:fallback")
+        session.messages = [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+        ]
+        session.metadata = {}
+        consolidator.sessions._session_cache[session.key] = session
+        consolidator._SAFETY_BUFFER = 0
+        consolidator.estimate_session_prompt_tokens = MagicMock(
+            side_effect=[(1200, "tiktoken"), (80, "tiktoken")]
+        )
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content=snip, finish_reason="stop"),
+            RuntimeError("recap failed"),
+        ]
+
+        await consolidator.maybe_consolidate_by_tokens(session, runtime=runtime)
+
+        assert session.last_consolidated > 0
+        assert session.metadata["_last_summary"]["text"] == snip
+
+    async def test_under_budget_does_not_call_recap(
+        self, consolidator, mock_provider, runtime
+    ):
+        consolidator.refresh_working_recap = AsyncMock(return_value="should not run")
+        consolidator.archive = AsyncMock(return_value="snip")
+        session = Session(key="cli:idle")
+        session.add_message("user", "hi")
+        consolidator.sessions._session_cache[session.key] = session
+        consolidator._SAFETY_BUFFER = 0
+        consolidator.estimate_session_prompt_tokens = MagicMock(return_value=(10, "tiktoken"))
+        runtime = replace(runtime, context_window_tokens=1000)
+        consolidator._SAFETY_BUFFER = 0
+
+        await consolidator.maybe_consolidate_by_tokens(session, runtime=runtime)
+
+        consolidator.archive.assert_not_awaited()
+        consolidator.refresh_working_recap.assert_not_awaited()
+        assert "_last_summary" not in session.metadata
+
+    async def test_iterative_recap_passes_previous_checkpoint(
+        self, consolidator, mock_provider, runtime, monkeypatch
+    ):
+        monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 150)
+        previous = "## Goal\nOld goal"
+        recap = "## Goal\nUpdated goal"
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content="- [skip] x", finish_reason="stop"),
+            MagicMock(content=recap, finish_reason="stop"),
+        ]
+        session = Session(key="cli:iter")
+        session.messages = [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+        ]
+        session.metadata = {
+            "_last_summary": {
+                "text": previous,
+                "last_active": session.updated_at.isoformat(),
+            }
+        }
+        consolidator.sessions._session_cache[session.key] = session
+        consolidator._SAFETY_BUFFER = 0
+        consolidator.estimate_session_prompt_tokens = MagicMock(
+            side_effect=[(1200, "tiktoken"), (80, "tiktoken")]
+        )
+
+        await consolidator.maybe_consolidate_by_tokens(session, runtime=runtime)
+
+        recap_call = _llm_call_for_prompt(mock_provider, "session checkpoint")
+        payload = recap_call.kwargs["messages"][1]["content"]
+        assert "<previous-checkpoint>" in payload
+        assert previous in payload
+
+    async def test_tool_results_truncated_in_archive_and_recap_payload(
+        self, consolidator, mock_provider, runtime
+    ):
+        huge = "x" * 20_000
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="ok", finish_reason="stop"
+        )
+        messages = [
+            {"role": "user", "content": "run it"},
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "name": "exec",
+                "content": huge,
+            },
+        ]
+        await consolidator.archive(messages, runtime=runtime)
+        archive_payload = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+        assert huge not in archive_payload
+        assert "[... truncated" in archive_payload
+        assert archive_payload.count("x") <= _TOOL_RESULT_MAX_CHARS
+
+        mock_provider.chat_with_retry.reset_mock()
+        mock_provider.chat_with_retry.return_value = MagicMock(
+            content="## Goal\nDone", finish_reason="stop"
+        )
+        await consolidator.refresh_working_recap(messages, runtime=runtime)
+        recap_payload = mock_provider.chat_with_retry.call_args.kwargs["messages"][1]["content"]
+        assert huge not in recap_payload
+        assert "[... truncated" in recap_payload
+
+    def test_cap_working_recap_preserves_goal_and_critical_context(self):
+        text = (
+            "## Goal\nKeep this\n\n"
+            "## Progress\n" + ("done item\n" * 400) + "\n"
+            "## Critical Context\nMust survive"
+        )
+        capped = Consolidator._cap_working_recap(text, max_chars=800)
+        assert len(capped) <= 800
+        assert "Keep this" in capped
+        assert "Must survive" in capped
+        assert capped.count("done item") < text.count("done item")
+
+    async def test_idle_compact_stores_recap_not_snip(
+        self, store, mock_provider, runtime
+    ):
+        from nanobot.session.manager import SessionManager
+
+        snip = "- [durable] likes tea"
+        recap = "## Goal\nDrink tea"
+        mock_provider.chat_with_retry.side_effect = [
+            MagicMock(content=snip, finish_reason="stop"),
+            MagicMock(content=recap, finish_reason="stop"),
+        ]
+        sessions = SessionManager(store.workspace)
+        consolidator = Consolidator(
+            store=store,
+            sessions=sessions,
+            build_messages=MagicMock(return_value=[]),
+            get_tool_definitions=MagicMock(return_value=[]),
+        )
+        session = sessions.get_or_create("cli:idle-recap")
+        for i in range(12):
+            session.add_message("user", f"u{i}")
+            session.add_message("assistant", f"a{i}")
+        sessions.save(session)
+
+        result = await consolidator.compact_idle_session(
+            "cli:idle-recap", runtime=runtime, max_suffix=4
+        )
+        assert result == recap
+        reloaded = sessions.get_or_create("cli:idle-recap")
+        assert reloaded.metadata["_last_summary"]["text"] == recap
+        entries = store.read_unprocessed_history(since_cursor=0)
+        assert any(snip in e["content"] for e in entries)
+

@@ -61,6 +61,22 @@ class AutoCompact:
         return f"Previous conversation summary (last active {last_active.isoformat()}):\n{text}"
 
     @classmethod
+    def summary_from_session(cls, session: Session) -> str | None:
+        """Format a persisted working checkpoint for prompt injection."""
+        meta = session.metadata.get("_last_summary") if isinstance(session.metadata, dict) else None
+        if not isinstance(meta, dict):
+            return None
+        text = meta.get("text")
+        last_active = meta.get("last_active")
+        if not isinstance(text, str) or not text.strip() or text.strip() == "(nothing)":
+            return None
+        try:
+            ts = datetime.fromisoformat(last_active) if isinstance(last_active, str) else session.updated_at
+        except ValueError:
+            ts = session.updated_at
+        return cls._format_summary(text, ts)
+
+    @classmethod
     def _is_internal_session(cls, key: str) -> bool:
         return key.startswith(cls._INTERNAL_SESSION_PREFIXES)
 
