@@ -7,9 +7,19 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from pydantic import AliasChoices, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
-from nanobot.command.new_intent import DEFAULT_NEW_SESSION_PHRASES
 from nanobot.config_base import Base
 from nanobot.cron.types import CronSchedule
+
+# Keep this constant in schema (not nanobot.command): importing the command
+# package loads AgentLoop, which imports schema and would circular-import.
+DEFAULT_NEW_SESSION_PHRASES: tuple[str, ...] = (
+    "新对话",
+    "新会话",
+    "新任务",
+    "new",
+    "new chat",
+    "new session",
+)
 
 if TYPE_CHECKING:
     from nanobot.agent.tools.cli_apps import CliAppsToolConfig

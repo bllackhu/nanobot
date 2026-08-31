@@ -5,15 +5,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from nanobot.command.router import normalize_command_text
+from nanobot.config.schema import DEFAULT_NEW_SESSION_PHRASES
 
-DEFAULT_NEW_SESSION_PHRASES: tuple[str, ...] = (
-    "新对话",
-    "新会话",
-    "新任务",
-    "new",
-    "new chat",
-    "new session",
-)
+__all__ = [
+    "DEFAULT_NEW_SESSION_PHRASES",
+    "is_new_session_phrase",
+    "is_new_session_trigger",
+    "normalize_new_session_phrase",
+]
 
 _TRAILING_PUNCTUATION = "。.!！？?"
 
