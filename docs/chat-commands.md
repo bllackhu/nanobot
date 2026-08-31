@@ -27,7 +27,9 @@ These commands work inside chat channels and interactive agent sessions:
 | `/pairing revoke <channel> <user_id>` | Revoke a previously approved user on a specific channel |
 | `/help` | Show available in-chat commands |
 
-Whole-message aliases for `/new` can also start a fresh session. By default these are `新对话`, `新会话`, `新任务`, `new`, `new chat`, and `new session` (case-insensitive; optional trailing `。.!！？?`). The entire message must equal one of those phrases — `新对话，帮我写周报` is a normal chat turn. Configure or disable them with [`agents.defaults.newSessionPhrases`](./configuration.md#new-session-phrases).
+Whole-message aliases for `/new` can also start a fresh session. By default these are `新对话`, `新会话`, `新任务`, `new`, `new chat`, and `new session` (case-insensitive; optional trailing `。.!！？?`), plus `agents.defaults.botName` and the doubled form of that name (`虾宝` / `虾宝虾宝`). The entire message must equal one of those phrases — `新对话，帮我写周报` is a normal chat turn. Configure or disable the aliases with [`agents.defaults.newSessionPhrases`](./configuration.md#new-session-phrases); an empty list disables botName aliases too (`/new` still works).
+
+After a reset, the bot replies with [`agents.defaults.newSessionStartedMessage`](./configuration.md#new-session-phrases) (default `New session started.`). An empty value skips the confirmation.
 
 ## Pairing
 

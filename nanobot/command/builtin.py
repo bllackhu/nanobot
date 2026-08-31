@@ -300,7 +300,7 @@ async def cmd_new(ctx: CommandContext) -> OutboundMessage:
         )
     return OutboundMessage(
         channel=ctx.msg.channel, chat_id=ctx.msg.chat_id,
-        content="New session started.",
+        content=(loop.new_session_started_message or "").strip(),
         metadata=dict(ctx.msg.metadata or {})
     )
 

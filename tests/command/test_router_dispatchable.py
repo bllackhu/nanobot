@@ -85,6 +85,7 @@ class TestMidTurnCommandDispatchedDirectly:
         loop.sessions.invalidate = MagicMock()
         loop._schedule_background = MagicMock()
         loop._cancel_active_tasks = AsyncMock(return_value=0)
+        loop.new_session_started_message = "New session started."
         return loop
 
     @pytest.fixture()

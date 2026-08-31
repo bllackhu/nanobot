@@ -43,7 +43,11 @@ from nanobot.channels.feishu.instances import (
 )
 from nanobot.channels.feishu.websocket import get_feishu_ws_runner
 from nanobot.command import CommandRouter, register_builtin_commands
-from nanobot.command.new_intent import DEFAULT_NEW_SESSION_PHRASES, is_new_session_trigger
+from nanobot.command.new_intent import (
+    configured_new_session_phrases,
+    configured_new_session_started_message,
+    is_new_session_trigger,
+)
 from nanobot.config.paths import get_media_dir
 from nanobot.pairing import clear_channel
 from nanobot.utils.helpers import safe_filename
@@ -869,10 +873,13 @@ def _qr_register_inner(
 
 
 _STREAM_ELEMENT_ID = "streaming_md"
-_NEW_SESSION_DIVIDER_CONTENT = json.dumps({
-    "type": "divider",
-    "params": {"divider_text": {"text": "New session started."}},
-})
+
+
+def _new_session_divider_content(text: str) -> str:
+    return json.dumps({
+        "type": "divider",
+        "params": {"divider_text": {"text": text}},
+    }, ensure_ascii=False)
 
 
 @dataclass
@@ -953,6 +960,8 @@ class FeishuChannel(BaseChannel):
         self._bot_open_id: str | None = None
         self._background_tasks: set[asyncio.Task] = set()
         self._reaction_ids: dict[str, str] = {}  # message_id → reaction_id
+        self._new_session_phrases = configured_new_session_phrases()
+        self._new_session_started_message = configured_new_session_started_message()
 
     # ------------------------------------------------------------------
     # QR login — writes credentials directly to config.json
@@ -2529,8 +2538,10 @@ class FeishuChannel(BaseChannel):
                             await self._finalize_live_hint_card(msg.chat_id, msg.metadata)
                     return
 
+            confirm = (self._new_session_started_message or "").strip()
             if (
-                msg.content.strip() == "New session started."
+                confirm
+                and msg.content.strip() == confirm
                 and msg.metadata.get("chat_type") == "p2p"
                 and not msg.media
                 and not msg.buttons
@@ -2801,7 +2812,7 @@ class FeishuChannel(BaseChannel):
             # history-only (run immediately).
             if history_only and (
                 _LISTEN_CMD_PROBE.is_known_command(content)
-                or is_new_session_trigger(content, DEFAULT_NEW_SESSION_PHRASES)
+                or is_new_session_trigger(content, self._new_session_phrases)
             ):
                 history_only = False
 
@@ -2824,8 +2835,9 @@ class FeishuChannel(BaseChannel):
                 task.add_done_callback(self._on_background_task_done)
                 task.add_done_callback(lambda t: self._on_reaction_added(message_id, t))
 
-            if chat_type == "p2p" and is_new_session_trigger(
-                content, DEFAULT_NEW_SESSION_PHRASES
+            confirm = (self._new_session_started_message or "").strip()
+            if chat_type == "p2p" and confirm and is_new_session_trigger(
+                content, self._new_session_phrases
             ):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
@@ -2834,7 +2846,7 @@ class FeishuChannel(BaseChannel):
                     "open_id",
                     sender_id,
                     "system",
-                    _NEW_SESSION_DIVIDER_CONTENT,
+                    _new_session_divider_content(confirm),
                 )
 
             # Build session key for conversation isolation.

@@ -20,6 +20,7 @@ DEFAULT_NEW_SESSION_PHRASES: tuple[str, ...] = (
     "new chat",
     "new session",
 )
+DEFAULT_NEW_SESSION_STARTED_MESSAGE = "New session started."
 
 if TYPE_CHECKING:
     from nanobot.agent.tools.cli_apps import CliAppsToolConfig
@@ -168,7 +169,15 @@ class AgentDefaults(Base):
         default_factory=lambda: list(DEFAULT_NEW_SESSION_PHRASES),
         validation_alias=AliasChoices("newSessionPhrases", "new_session_phrases"),
         serialization_alias="newSessionPhrases",
-    )  # Whole-message aliases for /new; empty list disables
+    )  # Whole-message aliases for /new; empty list disables aliases including botName
+    new_session_started_message: str = Field(
+        default=DEFAULT_NEW_SESSION_STARTED_MESSAGE,
+        validation_alias=AliasChoices(
+            "newSessionStartedMessage",
+            "new_session_started_message",
+        ),
+        serialization_alias="newSessionStartedMessage",
+    )  # Confirmation text sent after /new; empty string skips the reply
     session_ttl_minutes: int = Field(
         default=15,
         ge=0,

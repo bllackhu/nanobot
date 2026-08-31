@@ -13,12 +13,18 @@ from nanobot.providers.base import LLMResponse
 from nanobot.session.webui_turns import WebuiTurnCoordinator
 
 
-def _make_full_loop(tmp_path: Path) -> AgentLoop:
+def _make_full_loop(tmp_path: Path, **kwargs) -> AgentLoop:
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
     provider.generation = SimpleNamespace(max_tokens=4096)
     provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="should not run"))
-    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path, model="test-model")
+    loop = AgentLoop(
+        bus=MessageBus(),
+        provider=provider,
+        workspace=tmp_path,
+        model="test-model",
+        **kwargs,
+    )
     WebuiTurnCoordinator(
         bus=loop.bus,
         sessions=loop.sessions,
@@ -183,6 +189,163 @@ async def test_dispatch_history_only_new_phrase_disabled(tmp_path: Path) -> None
     loop.provider.chat_with_retry.assert_not_awaited()
     session = loop.sessions.get_or_create("feishu:oc_group")
     assert session.messages[0]["content"] == "新对话"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_history_only_bot_name_clears_session(tmp_path: Path) -> None:
+    """botName and the doubled form bypass history-only like /new."""
+    loop = _make_full_loop(tmp_path, bot_name="虾宝")
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    loop.consolidator.archive = AsyncMock()  # type: ignore[method-assign]
+    loop.provider.chat_with_retry = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("LLM must not run for botName wakeup"),
+    )
+
+    await loop._dispatch(
+        InboundMessage(
+            channel="feishu",
+            sender_id="ou_alice",
+            chat_id="oc_group",
+            content="old context",
+            metadata={INBOUND_META_HISTORY_ONLY: True},
+        )
+    )
+    session = loop.sessions.get_or_create("feishu:oc_group")
+    assert len(session.messages) == 1
+
+    outbound: list = []
+    original_publish = loop.bus.publish_outbound
+
+    async def capture_outbound(msg):
+        outbound.append(msg)
+        await original_publish(msg)
+
+    loop.bus.publish_outbound = capture_outbound  # type: ignore[method-assign]
+
+    await loop._dispatch(
+        InboundMessage(
+            channel="feishu",
+            sender_id="ou_alice",
+            chat_id="oc_group",
+            content="虾宝虾宝",
+            metadata={INBOUND_META_HISTORY_ONLY: True},
+        )
+    )
+
+    loop.provider.chat_with_retry.assert_not_awaited()
+    session = loop.sessions.get_or_create("feishu:oc_group")
+    assert session.messages == []
+    assert any(getattr(m, "content", None) == "New session started." for m in outbound)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_custom_new_session_started_message(tmp_path: Path) -> None:
+    """Configured confirmation text is what /new publishes."""
+    loop = _make_full_loop(tmp_path, new_session_started_message="已开启新对话")
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    loop.consolidator.archive = AsyncMock()  # type: ignore[method-assign]
+    loop.provider.chat_with_retry = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("LLM must not run for /new shortcut"),
+    )
+
+    outbound: list = []
+    original_publish = loop.bus.publish_outbound
+
+    async def capture_outbound(msg):
+        outbound.append(msg)
+        await original_publish(msg)
+
+    loop.bus.publish_outbound = capture_outbound  # type: ignore[method-assign]
+
+    await loop._dispatch(
+        InboundMessage(
+            channel="feishu",
+            sender_id="ou_alice",
+            chat_id="oc_group",
+            content="/new",
+        )
+    )
+
+    loop.provider.chat_with_retry.assert_not_awaited()
+    assert any(getattr(m, "content", None) == "已开启新对话" for m in outbound)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_empty_new_session_started_message_skips_confirmation(tmp_path: Path) -> None:
+    """Empty confirmation still clears the session but publishes no reply."""
+    loop = _make_full_loop(tmp_path, new_session_started_message="")
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    loop.consolidator.archive = AsyncMock()  # type: ignore[method-assign]
+    loop.provider.chat_with_retry = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("LLM must not run for /new shortcut"),
+    )
+
+    await loop._dispatch(
+        InboundMessage(
+            channel="feishu",
+            sender_id="ou_alice",
+            chat_id="oc_group",
+            content="old context",
+            metadata={INBOUND_META_HISTORY_ONLY: True},
+        )
+    )
+    session = loop.sessions.get_or_create("feishu:oc_group")
+    assert len(session.messages) == 1
+
+    outbound: list = []
+    original_publish = loop.bus.publish_outbound
+
+    async def capture_outbound(msg):
+        outbound.append(msg)
+        await original_publish(msg)
+
+    loop.bus.publish_outbound = capture_outbound  # type: ignore[method-assign]
+
+    await loop._dispatch(
+        InboundMessage(
+            channel="feishu",
+            sender_id="ou_alice",
+            chat_id="oc_group",
+            content="/new",
+        )
+    )
+
+    loop.provider.chat_with_retry.assert_not_awaited()
+    session = loop.sessions.get_or_create("feishu:oc_group")
+    assert session.messages == []
+    assert not any((getattr(m, "content", None) or "").strip() for m in outbound)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_empty_phrases_still_sends_started_message(tmp_path: Path) -> None:
+    """Empty newSessionPhrases disables aliases but /new still confirms."""
+    loop = _make_full_loop(tmp_path, new_session_phrases=[])
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    loop.consolidator.archive = AsyncMock()  # type: ignore[method-assign]
+    loop.provider.chat_with_retry = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("LLM must not run for /new shortcut"),
+    )
+
+    outbound: list = []
+    original_publish = loop.bus.publish_outbound
+
+    async def capture_outbound(msg):
+        outbound.append(msg)
+        await original_publish(msg)
+
+    loop.bus.publish_outbound = capture_outbound  # type: ignore[method-assign]
+
+    await loop._dispatch(
+        InboundMessage(
+            channel="feishu",
+            sender_id="ou_alice",
+            chat_id="oc_group",
+            content="/new",
+        )
+    )
+
+    loop.provider.chat_with_retry.assert_not_awaited()
+    assert any(getattr(m, "content", None) == "New session started." for m in outbound)
 
 
 @pytest.mark.asyncio

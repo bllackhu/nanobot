@@ -2159,7 +2159,8 @@ Users can start a fresh session without typing `/new` by sending a **whole-messa
 {
   "agents": {
     "defaults": {
-      "newSessionPhrases": ["新对话", "新会话", "新任务", "new", "new chat", "new session"]
+      "newSessionPhrases": ["新对话", "新会话", "新任务", "new", "new chat", "new session"],
+      "newSessionStartedMessage": "New session started."
     }
   }
 }
@@ -2168,6 +2169,8 @@ Users can start a fresh session without typing `/new` by sending a **whole-messa
 | Option | Default | Description |
 |--------|---------|-------------|
 | `agents.defaults.newSessionPhrases` | `["新对话", "新会话", "新任务", "new", "new chat", "new session"]` | Exact whole-message aliases for `/new`. Matching ignores surrounding whitespace, English case, and one trailing `。.!！？?`. Set to `[]` to disable aliases (`/new` still works). |
+| `agents.defaults.botName` | `"nanobot"` | CLI display name, also a whole-message `/new` alias together with the doubled form (`虾宝` and `虾宝虾宝`). Ignored when `newSessionPhrases` is `[]`. Changing this requires a gateway restart. |
+| `agents.defaults.newSessionStartedMessage` | `"New session started."` | Confirmation sent after `/new` (and aliases). An empty string still clears the session but sends no reply. Feishu private chats use the same text as the system divider and suppress the duplicate outbound. Changing this requires a gateway restart. |
 
 A longer sentence that merely contains a phrase (`new laptop`, `新对话，帮我写周报`) does not reset the session.
 
