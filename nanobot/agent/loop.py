@@ -9,6 +9,7 @@ import time
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, ExitStack, nullcontext, suppress
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from enum import Enum, auto
 from functools import partial
 from pathlib import Path
@@ -51,6 +52,7 @@ from nanobot.bus.runtime_events import (
 )
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.command.new_intent import effective_new_session_phrases, is_new_session_phrase
+from nanobot.command.router import normalize_command_text
 from nanobot.config.schema import AgentDefaults, ModelPresetConfig
 from nanobot.providers.base import LLMProvider
 from nanobot.providers.factory import ProviderSnapshot
@@ -169,6 +171,35 @@ class TurnContext:
     trace: list[StateTraceEntry] = field(default_factory=list)
 
 
+def _parse_session_timestamp(raw: Any) -> datetime | None:
+    if isinstance(raw, datetime):
+        ts = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            ts = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+    else:
+        return None
+    if ts.tzinfo is not None:
+        ts = ts.replace(tzinfo=None)
+    return ts
+
+
+def last_assistant_timestamp(session: Session) -> datetime | None:
+    """Latest non-command assistant timestamp in *session*, if any."""
+    latest: datetime | None = None
+    for message in session.messages:
+        if message.get("role") != "assistant" or message.get("_command"):
+            continue
+        ts = _parse_session_timestamp(message.get("timestamp"))
+        if ts is None:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -278,6 +309,8 @@ class AgentLoop:
         new_session_phrases: list[str] | None = None,
         bot_name: str | None = None,
         new_session_started_message: str | None = None,
+        idle_new_session_hint_after_hours: float | None = None,
+        idle_new_session_hint_message: str | None = None,
         tools_config: ToolsConfig | None = None,
         image_generation_provider_config: ProviderConfig | None = None,
         image_generation_provider_configs: dict[str, ProviderConfig] | None = None,
@@ -387,6 +420,16 @@ class AgentLoop:
             if new_session_started_message is not None
             else defaults.new_session_started_message
         )
+        self.idle_new_session_hint_after_hours = (
+            idle_new_session_hint_after_hours
+            if idle_new_session_hint_after_hours is not None
+            else defaults.idle_new_session_hint_after_hours
+        )
+        self.idle_new_session_hint_message = (
+            idle_new_session_hint_message
+            if idle_new_session_hint_message is not None
+            else defaults.idle_new_session_hint_message
+        )
         self._running = False
         self._mcp_servers = mcp_servers or {}
         self._mcp_stacks: dict[str, MCPConnection] = {}
@@ -491,6 +534,8 @@ class AgentLoop:
             new_session_phrases=defaults.new_session_phrases,
             bot_name=defaults.bot_name,
             new_session_started_message=defaults.new_session_started_message,
+            idle_new_session_hint_after_hours=defaults.idle_new_session_hint_after_hours,
+            idle_new_session_hint_message=defaults.idle_new_session_hint_message,
             session_ttl_minutes=defaults.session_ttl_minutes,
             consolidation_ratio=defaults.consolidation_ratio,
             tools_config=config.tools,
@@ -773,6 +818,37 @@ class AgentLoop:
         if is_new_session_phrase(raw, self.new_session_phrases):
             return dataclasses.replace(msg, content="/new")
         return msg
+
+    async def _maybe_publish_idle_new_session_hint(
+        self,
+        msg: InboundMessage,
+        session_key: str,
+    ) -> None:
+        """Remind once after a long idle gap; does not persist into session history."""
+        hours = self.idle_new_session_hint_after_hours
+        text = (self.idle_new_session_hint_message or "").strip()
+        if hours <= 0 or not text:
+            return
+        if msg.channel == "system" or msg.sender_id in {"subagent", "system"}:
+            return
+        _, automation_extra = automation_history_overrides(msg.metadata)
+        if automation_extra:
+            return
+        raw = msg.content.strip() if isinstance(msg.content, str) else ""
+        if normalize_command_text(raw).lower().startswith("/new"):
+            return
+        session = self.sessions.get_or_create(session_key)
+        last = last_assistant_timestamp(session)
+        if last is None:
+            return
+        if datetime.now() - last < timedelta(hours=hours):
+            return
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=text,
+            metadata=dict(msg.metadata or {}),
+        ))
 
     @staticmethod
     def _replay_token_budget(runtime: LLMRuntime) -> int:
@@ -1145,6 +1221,8 @@ class AgentLoop:
                     else:
                         self._ingest_history_only(msg, session_key)
                         return
+
+                await self._maybe_publish_idle_new_session_hint(msg, session_key)
 
                 # Only the task that owns the session lock may publish the
                 # active mid-turn injection queue for this session.

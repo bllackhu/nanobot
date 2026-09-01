@@ -2158,7 +2158,9 @@ Users can start a fresh session without typing `/new` by sending a **whole-messa
   "agents": {
     "defaults": {
       "newSessionPhrases": ["新对话", "新会话", "新任务", "new", "new chat", "new session"],
-      "newSessionStartedMessage": "New session started."
+      "newSessionStartedMessage": "New session started.",
+      "idleNewSessionHintAfterHours": 8,
+      "idleNewSessionHintMessage": "It's been over 8 hours since the last message. You can start a fresh session with /new or a new-session phrase whenever you want. A new session gives the agent a clean chat context; long-term memory is still available."
     }
   }
 }
@@ -2169,6 +2171,8 @@ Users can start a fresh session without typing `/new` by sending a **whole-messa
 | `agents.defaults.newSessionPhrases` | `["新对话", "新会话", "新任务", "new", "new chat", "new session"]` | Exact whole-message aliases for `/new`. Matching ignores surrounding whitespace, English case, and one trailing `。.!！？?`. Set to `[]` to disable aliases (`/new` still works). |
 | `agents.defaults.botName` | `"nanobot"` | CLI display name, also a whole-message `/new` alias together with the doubled form (`虾宝` and `虾宝虾宝`). Ignored when `newSessionPhrases` is `[]`. Changing this requires a gateway restart. |
 | `agents.defaults.newSessionStartedMessage` | `"New session started."` | Confirmation sent after `/new` (and aliases). An empty string still clears the session but sends no reply. Feishu private chats use the same text as the system divider and suppress the duplicate outbound. Changing this requires a gateway restart. |
+| `agents.defaults.idleNewSessionHintAfterHours` | `8` | Hours since the last assistant reply before sending an idle reminder on the next user turn. `0` disables. Fractions are allowed (for example `0.1` is 6 minutes). Changing this requires a gateway restart. |
+| `agents.defaults.idleNewSessionHintMessage` | *(English reminder about `/new` and long-term memory)* | Side-channel chat message sent once per idle gap. It is not stored in session history and does not auto-run `/new`. An empty string disables the send. Changing this requires a gateway restart. |
 
 A longer sentence that merely contains a phrase (`new laptop`, `新对话，帮我写周报`) does not reset the session.
 

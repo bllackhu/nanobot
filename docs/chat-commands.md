@@ -31,6 +31,8 @@ Whole-message aliases for `/new` can also start a fresh session. By default thes
 
 After a reset, the bot replies with [`agents.defaults.newSessionStartedMessage`](./configuration.md#new-session-phrases) (default `New session started.`). An empty value skips the confirmation.
 
+If the last assistant reply was more than [`idleNewSessionHintAfterHours`](./configuration.md#new-session-phrases) ago (default 8), the next user turn also gets a one-shot reminder from [`idleNewSessionHintMessage`](./configuration.md#new-session-phrases) before the agent answers. It does not start a new session by itself.
+
 ## Pairing
 
 When someone sends a DM to the bot and isn't on the allowlist — whether it's a new user or an existing user on a new channel — nanobot automatically replies with a **pairing code** (like `ABCD-EFGH`) that expires in 10 minutes. To grant them access:
