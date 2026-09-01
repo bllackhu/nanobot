@@ -21,6 +21,11 @@ DEFAULT_NEW_SESSION_PHRASES: tuple[str, ...] = (
     "new session",
 )
 DEFAULT_NEW_SESSION_STARTED_MESSAGE = "New session started."
+DEFAULT_IDLE_NEW_SESSION_HINT_MESSAGE = (
+    "It's been over 8 hours since the last message. You can start a fresh session "
+    "with /new or a new-session phrase whenever you want. A new session gives the "
+    "agent a clean chat context; long-term memory is still available."
+)
 
 if TYPE_CHECKING:
     from nanobot.agent.tools.cli_apps import CliAppsToolConfig
@@ -178,6 +183,23 @@ class AgentDefaults(Base):
         ),
         serialization_alias="newSessionStartedMessage",
     )  # Confirmation text sent after /new; empty string skips the reply
+    idle_new_session_hint_after_hours: float = Field(
+        default=8,
+        ge=0,
+        validation_alias=AliasChoices(
+            "idleNewSessionHintAfterHours",
+            "idle_new_session_hint_after_hours",
+        ),
+        serialization_alias="idleNewSessionHintAfterHours",
+    )  # Hours since last assistant reply before the idle hint; 0 disables; fractions allowed
+    idle_new_session_hint_message: str = Field(
+        default=DEFAULT_IDLE_NEW_SESSION_HINT_MESSAGE,
+        validation_alias=AliasChoices(
+            "idleNewSessionHintMessage",
+            "idle_new_session_hint_message",
+        ),
+        serialization_alias="idleNewSessionHintMessage",
+    )  # Side-channel reminder after a long idle gap; empty string disables the send
     session_ttl_minutes: int = Field(
         default=15,
         ge=0,
