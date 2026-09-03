@@ -73,7 +73,10 @@ class FeishuConnectStore:
         self._cleanup()
         try:
             feishu._init_registration(domain)
-            begin = feishu._begin_registration(domain)
+            begin = feishu._begin_registration(
+                domain,
+                addons=_login_addons_for_instance(instance_id),
+            )
         except (RuntimeError, OSError, json.JSONDecodeError, httpx.HTTPError) as exc:
             raise ChannelConnectError(
                 f"Unable to start Feishu/Lark connection: {exc}",
@@ -185,6 +188,26 @@ def _resolve_instance_id(instance_id: str, mode: str) -> str:
         return validate_instance_id(instance_id or DEFAULT_INSTANCE_ID)
     except ValueError as exc:
         raise ChannelConnectError(str(exc), status=400) from exc
+
+
+def _login_addons_for_instance(instance_id: str) -> dict | None:
+    """Resolve QR-login addons for the connect target instance from on-disk config.
+
+    Falls back to the built-in defaults when the instance config is absent or
+    unset, so a fresh connect gets cardkit:card:write + im.message.recalled_v1.
+    """
+    from nanobot.config.loader import load_config
+
+    try:
+        full_config = load_config()
+        feishu_cfg = getattr(full_config.channels, "feishu", None) or {}
+        specs = feishu.feishu_instance_specs(feishu_cfg, feishu.feishu_default_config())
+    except Exception:
+        specs = []
+    for spec in specs:
+        if spec.instance_id == instance_id:
+            return feishu._login_addons_from_config(spec.config)
+    return feishu._login_addons_from_config(None)
 
 
 def _default_instance_name(instance_id: str) -> str:

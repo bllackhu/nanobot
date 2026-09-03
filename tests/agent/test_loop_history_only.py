@@ -65,6 +65,39 @@ async def test_dispatch_history_only_persists_without_llm_or_outbound(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_dispatch_history_only_persists_message_id_extra(tmp_path: Path) -> None:
+    loop = _make_full_loop(tmp_path)
+    loop.consolidator.maybe_consolidate_by_tokens = AsyncMock(return_value=False)  # type: ignore[method-assign]
+    loop._process_message = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    await loop._dispatch(
+        InboundMessage(
+            channel="feishu",
+            sender_id="ou_alice",
+            chat_id="oc_group",
+            content="group chatter",
+            metadata={
+                INBOUND_META_HISTORY_ONLY: True,
+                "_session_message_extra": {
+                    "message_id": "om_listen1",
+                    "chat_id": "oc_group",
+                    "sender_id": "ou_alice",
+                    "history_only": True,
+                },
+            },
+        )
+    )
+
+    session = loop.sessions.get_or_create("feishu:oc_group")
+    stored = session.messages[0]
+    assert stored["message_id"] == "om_listen1"
+    assert stored["history_only"] is True
+    assert stored["chat_id"] == "oc_group"
+    assert stored["sender_id"] == "ou_alice"
+    loop._process_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_dispatch_history_only_new_command_clears_session(tmp_path: Path) -> None:
     """Known slash commands bypass history-only and run (e.g. /new clears session)."""
     loop = _make_full_loop(tmp_path)

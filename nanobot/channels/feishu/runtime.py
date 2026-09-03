@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import gzip
 import importlib.util
 import json
 import os
@@ -16,6 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from rich.console import Console
 from rich.markup import escape
@@ -46,6 +49,7 @@ from nanobot.utils.logging_bridge import redirect_lib_logging
 
 if TYPE_CHECKING:
     from lark_oapi.api.im.v1.model import MentionEvent, P2ImMessageReceiveV1
+    from nanobot.session.manager import SessionManager
 
 FEISHU_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 _LOGIN_CONSOLE = Console()
@@ -433,9 +437,67 @@ _ONBOARD_ACCOUNTS_URLS = {
 _REGISTRATION_PATH = "/oauth/v1/app/registration"
 _ONBOARD_REQUEST_TIMEOUT_S = 10
 
+# Default scopes/events pre-filled on the scan-to-create confirm page when the
+# Feishu config does not override them. `cardkit:card:write` enables CardKit
+# streaming replies; `im.message.recalled_v1` lets listen-mode history drop a
+# recalled message before it reaches an LLM turn.
+_DEFAULT_QR_LOGIN_SCOPES = ["cardkit:card:write"]
+_DEFAULT_QR_LOGIN_EVENTS = ["im.message.recalled_v1"]
+
 
 def _accounts_base_url(domain: str) -> str:
     return _ONBOARD_ACCOUNTS_URLS.get(domain, _ONBOARD_ACCOUNTS_URLS["feishu"])
+
+
+def _resolve_qr_login_addons(scopes: list[str], events: list[str]) -> dict | None:
+    """Build the Feishu scan-to-create ``addons`` payload.
+
+    ``scopes``/``events`` are already-resolved lists (defaults applied). Returns
+    None when both are empty, so the caller can leave the QR URL untouched.
+    """
+    payload: dict = {}
+    if scopes:
+        payload["scopes"] = {"tenant": list(scopes)}
+    if events:
+        payload["events"] = {"items": {"tenant": list(events)}}
+    return payload or None
+
+
+def _encode_qr_login_addons(addons: dict) -> str:
+    """Encode an addons dict into the gzip->base64url form Feishu expects.
+
+    Matches the lark-oapi ``register_app(addons=...)`` encoding.
+    """
+    payload = json.dumps(addons, ensure_ascii=False, separators=(",", ":"))
+    compressed = gzip.compress(payload.encode("utf-8"), mtime=0)
+    return base64.urlsafe_b64encode(compressed).decode("ascii").rstrip("=")
+
+
+def _with_qr_login_addons(qr_url: str, addons: dict) -> str:
+    """Append a single ``addons`` query param to a QR URL, preserving the rest."""
+    parsed = urlparse(qr_url)
+    params = parse_qs(parsed.query)
+    params["addons"] = [_encode_qr_login_addons(addons)]
+    return urlunparse(parsed._replace(query=urlencode(params, doseq=True)))
+
+
+def _login_addons_from_config(conf: Any) -> dict | None:
+    """Resolve the QR-login ``addons`` payload from a Feishu config object/dict.
+
+    ``None`` config fields -> built-in defaults; ``[]`` -> that category dropped;
+    a list -> replaces the default for that category. Returns None when both end
+    up empty, so the QR URL is left untouched. Accepts a ``FeishuConfig`` (snake
+    attrs) or a normalized config dict (camelCase keys).
+    """
+    if isinstance(conf, dict):
+        scopes = conf.get("qr_login_scopes", conf.get("qrLoginScopes"))
+        events = conf.get("qr_login_events", conf.get("qrLoginEvents"))
+    else:
+        scopes = getattr(conf, "qr_login_scopes", None)
+        events = getattr(conf, "qr_login_events", None)
+    resolved_scopes = _DEFAULT_QR_LOGIN_SCOPES if scopes is None else list(scopes or [])
+    resolved_events = _DEFAULT_QR_LOGIN_EVENTS if events is None else list(events or [])
+    return _resolve_qr_login_addons(resolved_scopes, resolved_events)
 
 
 def _post_registration(base_url: str, body: dict[str, str]) -> dict:
@@ -472,8 +534,13 @@ def _init_registration(domain: str = "feishu") -> None:
         )
 
 
-def _begin_registration(domain: str = "feishu") -> dict:
-    """Start the device-code flow. Returns device_code, qr_url, interval, expire_in."""
+def _begin_registration(domain: str = "feishu", *, addons: dict | None = None) -> dict:
+    """Start the device-code flow. Returns device_code, qr_url, interval, expire_in.
+
+    When ``addons`` is provided, it is appended as the scan-to-create ``addons``
+    query param on the QR URL. When None, the URL is returned unchanged (callers
+    decide whether to apply defaults).
+    """
     base_url = _accounts_base_url(domain)
     res = _post_registration(base_url, {
         "action": "begin",
@@ -487,6 +554,8 @@ def _begin_registration(domain: str = "feishu") -> dict:
     qr_url = res.get("verification_uri_complete", "")
     if not qr_url:
         raise RuntimeError("Feishu / Lark registration did not return a login URL")
+    if addons:
+        qr_url = _with_qr_login_addons(qr_url, addons)
     return {
         "device_code": device_code,
         "qr_url": qr_url,
@@ -801,6 +870,7 @@ def refresh_saved_feishu_identities(
 def qr_register(
     *,
     initial_domain: str = "feishu",
+    addons: dict | None = None,
 ) -> dict | None:
     """Run the Feishu / Lark scan-to-create QR registration flow.
 
@@ -817,7 +887,7 @@ def qr_register(
     import httpx
 
     try:
-        return _qr_register_inner(initial_domain=initial_domain)
+        return _qr_register_inner(initial_domain=initial_domain, addons=addons)
     except (RuntimeError, OSError, json.JSONDecodeError, httpx.HTTPError) as exc:
         _LOGIN_CONSOLE.print(
             f"[yellow]Unable to start Feishu/Lark login:[/yellow] {escape(str(exc))}"
@@ -845,11 +915,12 @@ def _print_qr_code(url: str) -> None:
 def _qr_register_inner(
     *,
     initial_domain: str,
+    addons: dict | None = None,
 ) -> dict | None:
     """Run init → begin → poll. Raises on network/protocol errors."""
     _LOGIN_CONSOLE.print("[cyan]Preparing Feishu/Lark login...[/cyan]")
     _init_registration(initial_domain)
-    begin = _begin_registration(initial_domain)
+    begin = _begin_registration(initial_domain, addons=addons)
 
     _print_qr_code(begin["qr_url"])
 
@@ -888,7 +959,14 @@ class FeishuChannel(BaseChannel):
     Requires:
     - App ID and App Secret from Feishu Open Platform
     - Bot capability enabled
-    - Event subscription enabled (im.message.receive_v1)
+    - Event subscription enabled (im.message.receive_v1, and
+      im.message.recalled_v1 to drop unconsumed listen-mode history)
+    - `cardkit:card:write` permission for CardKit streaming replies
+
+    QR scan-to-create login pre-fills these on the confirmation page: it
+    requests `cardkit:card:write` (scope) and `im.message.recalled_v1` (event)
+    by default. Override via `channels.feishu.qrLoginScopes` /
+    `qrLoginEvents`; set a category to `[]` to drop it.
     """
 
     name = "feishu"
@@ -915,11 +993,17 @@ class FeishuChannel(BaseChannel):
             instance_id=instance_id,
         )
 
-    def __init__(self, config: Any, bus: MessageBus):
+    def __init__(
+        self,
+        config: Any,
+        bus: MessageBus,
+        session_manager: SessionManager | None = None,
+    ):
         if isinstance(config, dict):
             config = FeishuConfig.model_validate(config)
         super().__init__(config, bus)
         self.config: FeishuConfig = config
+        self._session_manager = session_manager
         self._client: Any = None
         self._ws_client: Any = None
         self._ws_runner = get_feishu_ws_runner()
@@ -960,7 +1044,10 @@ class FeishuChannel(BaseChannel):
 
         _LOGIN_CONSOLE.print("Authorize with the mobile app. nanobot will save the new bot credentials.\n")
 
-        result = qr_register(initial_domain=self.config.domain or "feishu")
+        result = qr_register(
+            initial_domain=self.config.domain or "feishu",
+            addons=_login_addons_from_config(self.config),
+        )
         if not result:
             _LOGIN_CONSOLE.print(
                 "[yellow]Login was not completed.[/yellow] "
@@ -1043,6 +1130,9 @@ class FeishuChannel(BaseChannel):
         )
         builder = self._register_optional_event(
             builder, "register_p2_im_message_message_read_v1", self._on_message_read
+        )
+        builder = self._register_optional_event(
+            builder, "register_p2_im_message_recalled_v1", self._on_message_recalled_sync
         )
         builder = self._register_optional_event(
             builder,
@@ -2726,6 +2816,15 @@ class FeishuChannel(BaseChannel):
             }
             if history_only:
                 metadata[INBOUND_META_HISTORY_ONLY] = True
+                extra: dict[str, Any] = {
+                    "message_id": message_id,
+                    "chat_id": chat_id,
+                    "sender_id": sender_id,
+                    "history_only": True,
+                }
+                if root_id:
+                    extra["root_id"] = root_id
+                metadata["_session_message_extra"] = extra
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
@@ -2738,6 +2837,37 @@ class FeishuChannel(BaseChannel):
 
         except Exception:
             self.logger.exception("Error processing message")
+
+    def _on_message_recalled_sync(self, data: Any) -> None:
+        """Sync handler for recalled messages (called from the WebSocket thread)."""
+        if not self._running:
+            return
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._on_message_recalled(data), self._loop)
+
+    async def _on_message_recalled(self, data: Any) -> None:
+        """Drop unconsumed listen-mode history when Feishu recalls a message."""
+        if not self._running:
+            return
+        try:
+            event = getattr(data, "event", None)
+            message_id = str(getattr(event, "message_id", None) or "")
+            chat_id = str(getattr(event, "chat_id", None) or "")
+            if not message_id:
+                return
+            self._processed_message_ids.pop(message_id, None)
+            sessions = self._session_manager
+            if sessions is None:
+                return
+            prefix = f"{self.name}:{chat_id}" if chat_id else self.name
+            deleted = sessions.delete_unconsumed_history_by_message_id(
+                message_id,
+                session_key_prefix=prefix,
+            )
+            if deleted:
+                self.logger.debug("dropped recalled listen message {}", message_id)
+        except Exception:
+            self.logger.exception("Error processing recalled message")
 
     def _on_reaction_created(self, data: Any) -> None:
         """Ignore reaction events so they do not generate SDK noise."""
