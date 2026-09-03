@@ -28,8 +28,9 @@ from nanobot.utils.prompt_templates import render_template
 def session_extra(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     """Return persisted kwargs for turn-attached capabilities."""
     out = cli_app_utils.session_extra(metadata) | mcp_tools.session_extra(metadata)
-    # Channel-specific structured fields (e.g. wecom_archive msgid/from/msgtype).
-    # Only keys explicitly provided by the channel are persisted — no global schema.
+    # Channel-specific structured fields (e.g. wecom_archive msgid/from/msgtype,
+    # feishu message_id/chat_id for listen-mode recall). Only keys explicitly
+    # provided by the channel are persisted — no global schema.
     extra = metadata.get("_session_message_extra") if isinstance(metadata, Mapping) else None
     if isinstance(extra, Mapping):
         for key, value in extra.items():

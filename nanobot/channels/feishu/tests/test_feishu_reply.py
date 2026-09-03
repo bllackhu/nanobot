@@ -38,6 +38,7 @@ def _make_feishu_channel(
     listen_emoji: str | object = _LISTEN_EMOJI_UNSET,
     bot_name: str | None = None,
     new_session_started_message: str | None = None,
+    session_manager=None,
 ) -> FeishuChannel:
     config_kwargs: dict = {
         "enabled": True,
@@ -51,7 +52,7 @@ def _make_feishu_channel(
     if listen_emoji is not _LISTEN_EMOJI_UNSET:
         config_kwargs["listen_emoji"] = listen_emoji
     config = FeishuConfig(**config_kwargs)
-    channel = FeishuChannel(config, MessageBus())
+    channel = FeishuChannel(config, MessageBus(), session_manager=session_manager)
     defaults = AgentDefaults()
     channel._new_session_phrases = effective_new_session_phrases(
         defaults.new_session_phrases,
@@ -1429,6 +1430,11 @@ async def test_listen_unmentioned_group_message_sets_history_only_and_adds_defau
     assert len(bus_spy) == 1
     assert bus_spy[0].metadata.get(INBOUND_META_HISTORY_ONLY) is True
     assert bus_spy[0].content == "side chatter"
+    extra = bus_spy[0].metadata.get("_session_message_extra") or {}
+    assert extra.get("message_id") == "om_listen1"
+    assert extra.get("history_only") is True
+    assert extra.get("chat_id") == "oc_abc"
+    assert extra.get("sender_id") == "ou_alice"
     await asyncio.sleep(0)
     channel._add_reaction.assert_awaited_once_with("om_listen1", "Pin")
     assert "om_listen1" not in channel._reaction_ids
@@ -1679,3 +1685,79 @@ async def test_mention_policy_still_drops_unmentioned_group_message() -> None:
 
     channel._handle_message.assert_not_awaited()
     channel._add_reaction.assert_not_awaited()
+
+
+def _make_recalled_event(*, message_id: str = "om_listen1", chat_id: str = "oc_abc"):
+    return SimpleNamespace(
+        event=SimpleNamespace(message_id=message_id, chat_id=chat_id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_recall_deletes_unconsumed_listen_history(tmp_path: Path) -> None:
+    from nanobot.session.manager import SessionManager
+
+    sm = SessionManager(tmp_path)
+    session = sm.get_or_create("feishu:oc_abc:om_listen1")
+    session.add_message(
+        "user",
+        "side chatter",
+        message_id="om_listen1",
+        history_only=True,
+    )
+    sm.save(session)
+
+    channel = _make_feishu_channel(group_policy="listen", session_manager=sm)
+    channel._processed_message_ids["om_listen1"] = None
+    await channel._on_message_recalled(_make_recalled_event())
+
+    session = sm.get_or_create("feishu:oc_abc:om_listen1")
+    assert session.messages == []
+    assert "om_listen1" not in channel._processed_message_ids
+
+
+@pytest.mark.asyncio
+async def test_recall_skips_consumed_listen_history(tmp_path: Path) -> None:
+    from nanobot.session.manager import SessionManager
+
+    sm = SessionManager(tmp_path)
+    session = sm.get_or_create("feishu:oc_abc")
+    session.add_message(
+        "user",
+        "side chatter",
+        message_id="om_listen1",
+        history_only=True,
+    )
+    session.add_message("assistant", "I saw that")
+    sm.save(session)
+
+    channel = _make_feishu_channel(
+        group_policy="listen",
+        topic_isolation=False,
+        session_manager=sm,
+    )
+    await channel._on_message_recalled(_make_recalled_event())
+
+    session = sm.get_or_create("feishu:oc_abc")
+    assert [m.get("content") for m in session.messages] == ["side chatter", "I saw that"]
+
+
+@pytest.mark.asyncio
+async def test_recall_scans_topic_isolation_sessions(tmp_path: Path) -> None:
+    from nanobot.session.manager import SessionManager
+
+    sm = SessionManager(tmp_path)
+    other = sm.get_or_create("feishu:oc_other:om_x")
+    other.add_message("user", "keep", message_id="om_other", history_only=True)
+    sm.save(other)
+    session = sm.get_or_create("feishu:oc_abc:om_root")
+    session.add_message("user", "drop me", message_id="om_topic", history_only=True)
+    sm.save(session)
+
+    channel = _make_feishu_channel(group_policy="listen", session_manager=sm)
+    await channel._on_message_recalled(
+        _make_recalled_event(message_id="om_topic", chat_id="oc_abc")
+    )
+
+    assert sm.get_or_create("feishu:oc_abc:om_root").messages == []
+    assert sm.get_or_create("feishu:oc_other:om_x").messages[0]["content"] == "keep"

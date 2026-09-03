@@ -469,6 +469,7 @@ If QR login is unavailable for your account, use manual setup below.
   - **Streaming replies** (default in nanobot): add **`cardkit:card:write`** (often labeled **Create and update cards** in the Feishu developer console). Required for CardKit entities and streamed assistant text. Older apps may not have it yet — open **Permission management**, enable the scope, then **publish** a new app version if the console requires it.
   - If you **cannot** add `cardkit:card:write`, set `"streaming": false` under `channels.feishu` (see below). The bot still works; replies use normal interactive cards without token-by-token streaming.
 - **Events**: Add `im.message.receive_v1` (receive messages)
+  - For `groupPolicy: "listen"`, also add `im.message.recalled_v1` (message recalled) so unmentioned group messages that have not yet reached an LLM turn are dropped from session history when the user recalls them
   - Select **Long Connection** mode (requires running nanobot first to establish connection)
 - Get **App ID** and **App Secret** from "Credentials & Basic Info"
 - Publish the app
@@ -512,7 +513,7 @@ If QR login is unavailable for your account, use manual setup below.
 > `streaming` defaults to `true`. Use `false` if your app does not have **`cardkit:card:write`** (see permissions above).
 > `encryptKey` and `verificationToken` are optional for Long Connection mode.
 > `allowFrom`: Add your open_id (find it in nanobot logs when you message the bot). Use `["*"]` to allow all users.
-> `groupPolicy`: `"mention"` (default — respond only when @mentioned; unmentioned group messages are dropped), `"open"` (respond to all group messages), `"listen"` (save all group messages into session context, but reply only when @mentioned — no LLM/reply for unmentioned messages; known slash commands such as `/new` still run immediately without @mention). Private chats always respond.
+> `groupPolicy`: `"mention"` (default — respond only when @mentioned; unmentioned group messages are dropped), `"open"` (respond to all group messages), `"listen"` (save all group messages into session context, but reply only when @mentioned — no LLM/reply for unmentioned messages; known slash commands such as `/new` still run immediately without @mention). Recalling an unmentioned listen message removes it from session history if the bot has not yet used that context in an @mention turn. Subscribe to `im.message.recalled_v1` in the Feishu developer console for that drop to work. Private chats always respond.
 > `reactEmoji`: Emoji for "processing" status (default: `OnIt`). See [available emojis](https://open.larkoffice.com/document/server-docs/im-v1/message-reaction/emojis-introduce).
 > `doneEmoji`: Optional emoji for "completed" status (e.g., `DONE`, `OK`, `HEART`). When set, bot adds this reaction after removing `reactEmoji`.
 > `listenEmoji`: Emoji on **listen** history-only ingest (unmentioned group messages). Default: `"Pin"`. Set `""` to disable (silent). This reaction is persistent (no stream cleanup). Does not affect @mention turns (those still use `reactEmoji` / `doneEmoji`).
@@ -530,6 +531,7 @@ If QR login is unavailable for your account, use manual setup below.
 > `liveToolHintDoneHoldMs`: How long (ms) to keep the static `… - done` line after a tool batch finishes before `AI thinking` may replace it (default: `200`, range 0–2000). Heartbeat is cancelled during that hold. `0` skips the extra hold. Only applies in `hintMode: "live"`.
 > `liveToolHintElapsedAfterMs`: Hide the live-card elapsed label until the currently visible in-progress line (in-flight tool, `consolidating history`, or `AI thinking`) has been on the card at least this long (ms, default: `3000`, range 0–600000). Heartbeat then inserts a one-decimal label (`3.0s`, `3.3s`) between the line and the pulse. `0` shows from the first heartbeat after the line is committed (still omits a literal `0.0s`). Heartbeat `0` disables both pulse and counter. Done and `history consolidated` stay without a timer. Only applies in `hintMode: "live"`.
 > `domain`: `"feishu"` (default) for China (open.feishu.cn), `"lark"` for international Lark (open.larksuite.com).
+> `qrLoginScopes` / `qrLoginEvents`: Optional QR scan-to-create login pre-fills. Defaults to `cardkit:card:write` (scope) and `im.message.recalled_v1` (event). Set a category to `[]` to drop it, or a non-empty list to replace it. Both camelCase and snake_case keys are accepted. See [Feishu AI Agent](./guides/feishu-ai-agent.md#qr-login-scopes-and-events).
 
 **3. Run**
 

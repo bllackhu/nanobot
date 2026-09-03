@@ -71,6 +71,11 @@ For manual apps, enable the Bot capability, receive-message events, and Long
 Connection mode. If your app cannot get the `cardkit:card:write` permission,
 set `"streaming": false`.
 
+When `groupPolicy` is `"listen"`, also subscribe to `im.message.recalled_v1`
+(撤回消息). Unmentioned group messages that have not yet been included in an
+@mention LLM turn are then dropped from session history if the user recalls
+them. Edits are not applied.
+
 ## Run nanobot gateway
 
 ```bash
@@ -99,7 +104,9 @@ After approval, DM the bot again or mention it in a group chat:
   static allowlist.
 - Keep `groupPolicy` as `"mention"` before inviting the bot into busy groups.
   Use `"listen"` when you want the bot to silently follow group context and
-  only reply when @mentioned. Use `"open"` only when every group message
+  only reply when @mentioned. Recalled unmentioned messages are removed from
+  that context if they have not yet reached an LLM turn (`im.message.recalled_v1`).
+  Use `"open"` only when every group message
   should trigger a reply.
 - Store app secrets through environment variables for deployed services.
 - Review file, shell, and web tool access before adding more users.
@@ -114,6 +121,33 @@ After approval, DM the bot again or mention it in a group chat:
   mode, and `nanobot gateway --verbose`.
 - If a first DM returns a pairing code, approve it before testing normal
   replies.
+
+## QR login scopes and events
+
+QR scan-to-create login pre-fills the app-confirmation page with the scopes and
+events the bot needs. By default it requests `cardkit:card:write` (CardKit
+streaming replies) and `im.message.recalled_v1` (listen-mode recall). You can
+override these per channel under `channels.feishu`:
+
+```json
+{
+  "channels": {
+    "feishu": {
+      "qrLoginScopes": ["cardkit:card:write"],
+      "qrLoginEvents": ["im.message.recalled_v1"]
+    }
+  }
+}
+```
+
+Semantics:
+
+- Omit both (or set to `null`) to use the built-in defaults above.
+- Set a category to `[]` to drop it (no scopes / no events requested).
+- Set a category to a non-empty list to replace the default for that category.
+
+Both snake_case (`qr_login_scopes`) and camelCase (`qrLoginScopes`) keys are
+accepted.
 
 ## Next: memory, automations, MCP tools
 

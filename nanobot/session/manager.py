@@ -155,6 +155,36 @@ class Session:
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
+    def find_message_index_by_id(self, message_id: str) -> int | None:
+        """Return the index of the first message with *message_id*, if any."""
+        if not message_id:
+            return None
+        for index, message in enumerate(self.messages):
+            if message.get("message_id") == message_id:
+                return index
+        return None
+
+    def is_unconsumed_history_only(self, index: int) -> bool:
+        """True when *index* is listen ingest that has not reached an LLM turn."""
+        if index < 0 or index >= len(self.messages):
+            return False
+        message = self.messages[index]
+        if message.get("role") != "user" or not message.get("history_only"):
+            return False
+        for later in self.messages[index + 1 :]:
+            if later.get("role") == "assistant" and not later.get("_command"):
+                return False
+        return True
+
+    def delete_message_at(self, index: int) -> None:
+        """Remove the message at *index* and keep last_consolidated consistent."""
+        del self.messages[index]
+        if index < self.last_consolidated:
+            self.last_consolidated = max(0, self.last_consolidated - 1)
+        elif self.last_consolidated > len(self.messages):
+            self.last_consolidated = len(self.messages)
+        self.updated_at = datetime.now()
+
     def get_history(
         self,
         max_messages: int = FILE_MAX_MESSAGES,
@@ -649,6 +679,52 @@ class SessionManager:
             "metadata": session.metadata,
             "messages": session.messages,
         }
+
+    def _session_keys_matching_prefix(self, prefix: str) -> list[str]:
+        """Cached and on-disk session keys equal to *prefix* or ``prefix:*``."""
+        keys: list[str] = []
+        seen: set[str] = set()
+
+        def _add(key: str) -> None:
+            if not key or key in seen:
+                return
+            if prefix and key != prefix and not key.startswith(prefix + ":"):
+                return
+            seen.add(key)
+            keys.append(key)
+
+        for key in list(self._cache.keys()):
+            _add(key)
+        for key in list(self._overflow_cache.keys()):
+            _add(key)
+        for info in self.list_sessions():
+            _add(str(info.get("key") or ""))
+        return keys
+
+    def delete_unconsumed_history_by_message_id(
+        self,
+        message_id: str,
+        *,
+        session_key_prefix: str = "",
+    ) -> bool:
+        """Delete a listen-ingest user row that has not reached an LLM turn.
+
+        Returns True when a row was removed. Returns False when the id was not
+        found or a later non-command assistant message already consumed it.
+        """
+        if not message_id:
+            return False
+        for key in self._session_keys_matching_prefix(session_key_prefix):
+            session = self.get_or_create(key)
+            index = session.find_message_index_by_id(message_id)
+            if index is None:
+                continue
+            if not session.is_unconsumed_history_only(index):
+                return False
+            session.delete_message_at(index)
+            self.save(session)
+            return True
+        return False
 
     def save(self, session: Session, *, fsync: bool = False) -> None:
         """Save a session to disk atomically.

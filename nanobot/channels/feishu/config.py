@@ -40,6 +40,11 @@ class FeishuConfig(Base):
     streaming: bool = True
     domain: Literal["feishu", "lark"] = "feishu"
     topic_isolation: bool = True
+    # QR-login `addons`: which scopes/events the scan-to-create confirm page
+    # pre-fills. None -> built-in defaults (cardkit:card:write +
+    # im.message.recalled_v1); [] -> drop that category; a list -> replaces it.
+    qr_login_scopes: list[str] | None = None
+    qr_login_events: list[str] | None = None
 
 
 def feishu_default_config() -> dict[str, object]:

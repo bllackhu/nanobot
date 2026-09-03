@@ -1,4 +1,7 @@
+import base64
+import gzip
 import json
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
@@ -8,6 +11,11 @@ from nanobot.channels.feishu.runtime import FeishuChannel
 from nanobot.config import loader
 from nanobot.config.schema import Config
 from nanobot.pairing import store as pairing_store
+
+
+def _decode_addons(encoded: str) -> dict:
+    payload = json.loads(gzip.decompress(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))))
+    return payload
 
 
 def _default_feishu_instance(data: dict) -> dict:
@@ -24,7 +32,7 @@ async def test_feishu_login_writes_credentials_to_active_config(monkeypatch, tmp
     monkeypatch.setattr(
         feishu_module,
         "qr_register",
-        lambda initial_domain="feishu": {
+        lambda initial_domain="feishu", addons=None: {
             "app_id": "cli_app",
             "app_secret": "secret",
             "domain": "lark",
@@ -431,7 +439,7 @@ async def test_feishu_login_creates_missing_active_config(monkeypatch, tmp_path)
     monkeypatch.setattr(
         feishu_module,
         "qr_register",
-        lambda initial_domain="feishu": {
+        lambda initial_domain="feishu", addons=None: {
             "app_id": "cli_app",
             "app_secret": "secret",
             "domain": "feishu",
@@ -446,3 +454,96 @@ async def test_feishu_login_creates_missing_active_config(monkeypatch, tmp_path)
     instance = _default_feishu_instance(data)
     assert instance["id"] == "default"
     assert instance["appId"] == "cli_app"
+    assert instance["appSecret"] == "secret"
+    assert instance["domain"] == "feishu"
+
+
+def test_begin_registration_appends_addons(monkeypatch):
+    login_url = "https://accounts.feishu.cn/login?device_code=device"
+    monkeypatch.setattr(
+        feishu_module,
+        "_post_registration",
+        lambda _base_url, _body: {
+            "device_code": "device",
+            "verification_uri_complete": login_url,
+        },
+    )
+    addons = {
+        "scopes": {"tenant": ["cardkit:card:write"]},
+        "events": {"items": {"tenant": ["im.message.recalled_v1"]}},
+    }
+    begin = feishu_module._begin_registration(addons=addons)
+    assert begin["qr_url"].startswith(login_url)
+    query = parse_qs(urlparse(begin["qr_url"]).query)
+    assert len(query["addons"]) == 1
+    assert _decode_addons(query["addons"][0]) == addons
+
+
+def test_begin_registration_without_addons_preserves_url(monkeypatch):
+    login_url = "https://accounts.feishu.cn/login?device_code=device"
+    monkeypatch.setattr(
+        feishu_module,
+        "_post_registration",
+        lambda _base_url, _body: {
+            "device_code": "device",
+            "verification_uri_complete": login_url,
+        },
+    )
+    assert feishu_module._begin_registration()["qr_url"] == login_url
+
+
+def test_resolve_qr_login_addons_defaults():
+    addons = feishu_module._resolve_qr_login_addons(["cardkit:card:write"], ["im.message.recalled_v1"])
+    assert addons == {
+        "scopes": {"tenant": ["cardkit:card:write"]},
+        "events": {"items": {"tenant": ["im.message.recalled_v1"]}},
+    }
+
+
+def test_resolve_qr_login_addons_overrides():
+    addons = feishu_module._resolve_qr_login_addons(["a"], ["b", "c"])
+    assert addons == {
+        "scopes": {"tenant": ["a"]},
+        "events": {"items": {"tenant": ["b", "c"]}},
+    }
+
+
+def test_resolve_qr_login_addons_empty_returns_none():
+    assert feishu_module._resolve_qr_login_addons([], []) is None
+    assert feishu_module._resolve_qr_login_addons(["a"], []) == {"scopes": {"tenant": ["a"]}}
+
+
+def test_login_addons_from_config_object_defaults():
+    from nanobot.channels.feishu.config import FeishuConfig
+
+    conf = FeishuConfig()
+    addons = feishu_module._login_addons_from_config(conf)
+    assert addons == {
+        "scopes": {"tenant": ["cardkit:card:write"]},
+        "events": {"items": {"tenant": ["im.message.recalled_v1"]}},
+    }
+
+
+def test_login_addons_from_config_object_disables_category():
+    from nanobot.channels.feishu.config import FeishuConfig
+
+    conf = FeishuConfig(qr_login_events=[])
+    addons = feishu_module._login_addons_from_config(conf)
+    assert addons == {"scopes": {"tenant": ["cardkit:card:write"]}}
+
+
+def test_login_addons_from_config_dict_camel_and_empty():
+    addons = feishu_module._login_addons_from_config(
+        {"qrLoginScopes": [], "qrLoginEvents": []}
+    )
+    assert addons is None
+
+
+def test_login_addons_from_config_dict_custom():
+    addons = feishu_module._login_addons_from_config(
+        {"qrLoginEvents": ["im.message.receive_v1"], "qrLoginScopes": ["im:message.group_msg"]}
+    )
+    assert addons == {
+        "scopes": {"tenant": ["im:message.group_msg"]},
+        "events": {"items": {"tenant": ["im.message.receive_v1"]}},
+    }
