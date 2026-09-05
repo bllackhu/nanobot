@@ -157,17 +157,19 @@ class TestStreamUpdateText:
     def test_returns_true_on_success(self):
         ch = _make_channel()
         ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response(True)
-        assert ch._stream_update_text_sync("card_1", "hello", 1) is True
+        assert ch._stream_update_text_sync("card_1", "hello", 1) == (True, None)
 
     def test_returns_false_on_failure(self):
         ch = _make_channel()
         ch._client.cardkit.v1.card_element.content.return_value = _mock_content_response(False)
-        assert ch._stream_update_text_sync("card_1", "hello", 1) is False
+        ok, err_code = ch._stream_update_text_sync("card_1", "hello", 1)
+        assert ok is False
+        assert err_code == 99999
 
     def test_returns_false_on_exception(self):
         ch = _make_channel()
         ch._client.cardkit.v1.card_element.content.side_effect = RuntimeError("err")
-        assert ch._stream_update_text_sync("card_1", "hello", 1) is False
+        assert ch._stream_update_text_sync("card_1", "hello", 1) == (False, None)
 
 
 class TestSendDelta:

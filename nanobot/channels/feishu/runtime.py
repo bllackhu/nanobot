@@ -2264,8 +2264,25 @@ class FeishuChannel(BaseChannel):
             self.logger.warning("Error creating streaming card: {}", e)
             return None
 
-    def _stream_update_text_sync(self, card_id: str, content: str, sequence: int) -> bool:
-        """Stream-update the markdown element on a CardKit card (typewriter effect)."""
+    @classmethod
+    def _fatal_card_error_code(cls, code: int) -> bool:
+        """True when a CardKit error means the streaming session is dead.
+
+        Feishu kills the streaming session when it times out (code 200850);
+        after that any content/settings update on the card keeps failing, so
+        retrying only burns API quota. Treat this as fatal so the caller can
+        stop re-arming / stop re-sending on the dead card.
+        """
+        return code == 200850
+
+    def _stream_update_text_sync(self, card_id: str, content: str, sequence: int) -> tuple[bool, int | None]:
+        """Stream-update the markdown element on a CardKit card (typewriter effect).
+
+        Returns ``(success, error_code)`` where ``error_code`` is the Feishu
+        response code on an ``unsuccessful`` call (None on success or on a
+        transport/parse exception).  ``_fatal_card_error_code`` can then be used
+        to short-circuit retries on a dead streaming session.
+        """
         from lark_oapi.api.cardkit.v1 import (
             ContentCardElementRequest,
             ContentCardElementRequestBody,
@@ -2292,11 +2309,11 @@ class FeishuChannel(BaseChannel):
                     response.code,
                     response.msg,
                 )
-                return False
-            return True
+                return False, int(response.code) if response.code is not None else None
+            return True, None
         except Exception as e:
             self.logger.warning("Error stream-updating card {}: {}", card_id, e)
-            return False
+            return False, None
 
     def _set_streaming_mode_sync(self, card_id: str, enabled: bool, sequence: int) -> bool:
         """Set CardKit streaming_mode using a strictly increasing sequence."""
@@ -2346,13 +2363,20 @@ class FeishuChannel(BaseChannel):
         content: str,
         sequence: int,
     ) -> tuple[bool, int]:
-        if self._stream_update_text_sync(card_id, content, sequence):
+        ok, err_code = self._stream_update_text_sync(card_id, content, sequence)
+        if ok:
             return True, sequence
+        # A fatal card error (e.g. 200850: the streaming session timed out /
+        # was killed) means the card is dead; re-enabling streaming mode and
+        # re-sending only burns quota. Skip the reopen+retry and let the caller
+        # decide (heartbeat circuit breaker, fallback to a regular card, etc.).
+        if err_code is not None and self._fatal_card_error_code(err_code):
+            return False, sequence
         sequence += 1
         if not self._set_streaming_mode_sync(card_id, True, sequence):
             return False, sequence
         sequence += 1
-        return self._stream_update_text_sync(card_id, content, sequence), sequence
+        return self._stream_update_text_sync(card_id, content, sequence)[0], sequence
 
     async def send_delta(
         self,
@@ -3607,6 +3631,13 @@ class FeishuChannel(BaseChannel):
         interval = self.config.live_tool_hint_heartbeat_seconds
         if interval <= 0 or self.config.hint_mode != "live":
             return
+        # Avoid re-arming onto a stream whose buffer was dropped (e.g. a card
+        # the heartbeat circuit breaker just treated as dead). A live card with
+        # no buffer cannot pulse; re-arming would create a heartbeat task that
+        # immediately exits, but only if a buffer exists — guard against it so
+        # a killed card is not resurrected.
+        if stream_key not in self._live_hint_bufs:
+            return
         self._cancel_live_hint_heartbeat(stream_key)
         task = asyncio.create_task(
             self._live_hint_heartbeat_loop(chat_id, stream_key, interval)
@@ -3664,6 +3695,8 @@ class FeishuChannel(BaseChannel):
         """
         loop = asyncio.get_running_loop()
         next_tick = time.monotonic()
+        consecutive_failures = 0
+        max_failures = self.config.live_tool_hint_max_consecutive_failures
         while True:
             await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
             buf = self._live_hint_bufs.get(stream_key)
@@ -3683,7 +3716,24 @@ class FeishuChannel(BaseChannel):
                     buf, loop, buf.card_id, content, buf.sequence + 1
                 )
             if ok:
+                consecutive_failures = 0
                 buf.last_heartbeat = time.monotonic()
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    # Feishu likely killed the streaming session (e.g.
+                    # code=200850 card streaming timeout). Treat the card as
+                    # dead: drop its buffer so the loop exits and the next
+                    # tool/thinking hint creates a fresh card. Do NOT mark the
+                    # stream finalized — the turn is still running.
+                    self.logger.warning(
+                        "Live hint card {} stopped after {} consecutive update failures",
+                        stream_key,
+                        consecutive_failures,
+                    )
+                    self._live_hint_bufs.pop(stream_key, None)
+                    self._cancel_live_hint_heartbeat(stream_key)
+                    return
             next_tick += interval
             now = time.monotonic()
             while next_tick <= now:

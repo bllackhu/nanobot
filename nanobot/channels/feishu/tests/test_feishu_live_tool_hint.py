@@ -1073,6 +1073,115 @@ class TestHeartbeat:
         assert "\u00b7" not in sent_texts[-1]  # finalize is un-pulsed
 
 
+def _mock_fatal_content_response(code: int = 200850):
+    """A CardKit content response whose streaming session was killed by Feishu."""
+    resp = MagicMock()
+    resp.success.return_value = False
+    resp.code = code
+    resp.msg = "card streaming timeout"
+    return resp
+
+
+class TestHeartbeatCircuitBreaker:
+    """The heartbeat must stop overheating a card whose streaming session died."""
+
+    @pytest.mark.asyncio
+    async def test_stops_after_max_consecutive_failures(self):
+        ch = _make_channel(
+            live_tool_hint_heartbeat_seconds=0.05,
+            live_tool_hint_max_consecutive_failures=3,
+        )
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_fatal_content_response()
+        ch._client.cardkit.v1.card.settings.return_value = _mock_content_response(True)
+        ch._live_hint_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="working…",
+            card_id="card_live_1",
+            sequence=5,
+            last_edit=time.monotonic() - 60,
+            last_heartbeat=time.monotonic() - 60,
+        )
+
+        # Run the loop; it should self-terminate after 3 failures, not loop forever.
+        loop_task = asyncio.create_task(
+            ch._live_hint_heartbeat_loop("oc_chat1", "oc_chat1", 0.05)
+        )
+        await asyncio.wait_for(loop_task, timeout=2)
+        assert loop_task.done()
+
+        # The dead buffer is dropped so the next hint creates a fresh card.
+        assert "oc_chat1" not in ch._live_hint_bufs
+        content_calls = ch._client.cardkit.v1.card_element.content.call_count
+        assert content_calls == 3  # one per failure, no reopen retries
+
+    @pytest.mark.asyncio
+    async def test_success_resets_failure_counter(self):
+        ch = _make_channel(
+            live_tool_hint_heartbeat_seconds=0.05,
+            live_tool_hint_max_consecutive_failures=3,
+        )
+        ch._client.cardkit.v1.card_element.content.side_effect = [
+            _mock_fatal_content_response(),
+            _mock_fatal_content_response(),
+            _mock_content_response(True),  # transient blip resolved
+            _mock_fatal_content_response(),
+            _mock_fatal_content_response(),
+            _mock_fatal_content_response(),
+        ]
+        ch._client.cardkit.v1.card.settings.return_value = _mock_content_response(True)
+        ch._live_hint_bufs["oc_chat1"] = _FeishuStreamBuf(
+            text="working…",
+            card_id="card_live_1",
+            sequence=5,
+            last_edit=time.monotonic() - 60,
+            last_heartbeat=time.monotonic() - 60,
+        )
+
+        loop_task = asyncio.create_task(
+            ch._live_hint_heartbeat_loop("oc_chat1", "oc_chat1", 0.05)
+        )
+        await asyncio.wait_for(loop_task, timeout=2)
+        assert loop_task.done()
+        # Sequence: fail, fail, ok(reset), fail, fail, fail -> stops at the 6th.
+        assert ch._client.cardkit.v1.card_element.content.call_count == 6
+
+    @pytest.mark.asyncio
+    async def test_fatal_code_skips_reopen_retry(self):
+        ch = _make_channel()
+        ch._client.cardkit.v1.card_element.content.return_value = _mock_fatal_content_response()
+        ch._client.cardkit.v1.card.settings.return_value = _mock_content_response(True)
+
+        ok, seq = ch._stream_update_text_with_reopen_sync("card_1", "hello", 4)
+        assert ok is False
+        assert seq == 4  # no bump from the skipped reopen retry
+        # Only one content call; no set-streaming-mode reopen.
+        assert ch._client.cardkit.v1.card_element.content.call_count == 1
+        assert ch._client.cardkit.v1.card.settings.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_non_fatal_code_still_reopens_and_retries(self):
+        ch = _make_channel()
+        ch._client.cardkit.v1.card_element.content.side_effect = [
+            _mock_content_response(False),  # code 99999 (not fatal)
+            _mock_content_response(True),
+        ]
+        ch._client.cardkit.v1.card.settings.return_value = _mock_content_response(True)
+
+        ok, seq = ch._stream_update_text_with_reopen_sync("card_1", "hello", 4)
+        assert ok is True
+        assert seq == 6
+        assert ch._client.cardkit.v1.card_element.content.call_count == 2
+        assert ch._client.cardkit.v1.card.settings.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_arm_does_not_resurrect_dropped_buffer(self):
+        ch = _make_channel(live_tool_hint_heartbeat_seconds=0.1)
+        ch._live_hint_bufs.clear()
+        ch._arm_live_hint_heartbeat("oc_chat1", "oc_chat1")
+        # No heartbeat task should be created for a stream with no buffer.
+        assert "oc_chat1" not in ch._live_hint_heartbeat_tasks
+        assert ch._background_tasks == set()
+
+
 class TestLiveCardStreamingConfig:
     """The per-card typewriter speed is set once at card creation."""
 

@@ -503,6 +503,7 @@ If QR login is unavailable for your account, use manual setup below.
       "liveToolHintMinDwellMs": 800,
       "liveToolHintDoneHoldMs": 200,
       "liveToolHintElapsedAfterMs": 3000,
+      "liveToolHintMaxConsecutiveFailures": 5,
       "streaming": true,
       "domain": "feishu"
     }
@@ -530,6 +531,7 @@ If QR login is unavailable for your account, use manual setup below.
 > `liveToolHintDoneNote`: Note applied when a tool batch finishes, and again if the live card finalizes at the end of a turn (default: `"done"`). Tool lines swap `processing` → this note (e.g. `🔧 read docs/api.md - done`). A leftover thinking line at turn-end strips trailing periods and appends it (`AI thinking ...` → `AI thinking - done`). Only applies in `hintMode: "live"`.
 > `liveToolHintDoneHoldMs`: How long (ms) to keep the static `… - done` line after a tool batch finishes before `AI thinking` may replace it (default: `200`, range 0–2000). Heartbeat is cancelled during that hold. `0` skips the extra hold. Only applies in `hintMode: "live"`.
 > `liveToolHintElapsedAfterMs`: Hide the live-card elapsed label until the currently visible in-progress line (in-flight tool, `consolidating history`, or `AI thinking`) has been on the card at least this long (ms, default: `3000`, range 0–600000). Heartbeat then inserts a one-decimal label (`3.0s`, `3.3s`) between the line and the pulse. `0` shows from the first heartbeat after the line is committed (still omits a literal `0.0s`). Heartbeat `0` disables both pulse and counter. Done and `history consolidated` stay without a timer. Only applies in `hintMode: "live"`.
+> `liveToolHintMaxConsecutiveFailures`: Circuit breaker for the live-card heartbeat. Feishu can kill a card's streaming session mid-turn (e.g. `code=200850 card streaming timeout`); after that every content update fails. After this many **consecutive** failed heartbeat updates (default: `5`, range 1–50), the card is treated as dead — its buffer is dropped and the heartbeat stops, so a dead card can no longer burn API quota. A single successful update resets the counter, so a transient blip does not kill a healthy card. The next tool/thinking hint creates a fresh card. A `code=200850` also short-circuits the internal reopen+retry (skips re-enabling streaming mode), so a dead card costs one request per attempt instead of three. Only applies in `hintMode: "live"`. Set `liveToolHintHeartbeatSeconds: 0` to disable the heartbeat entirely.
 > `domain`: `"feishu"` (default) for China (open.feishu.cn), `"lark"` for international Lark (open.larksuite.com).
 > `qrLoginScopes` / `qrLoginEvents`: Optional QR scan-to-create login pre-fills. Defaults to `cardkit:card:write` (scope) and `im.message.recalled_v1` (event). Set a category to `[]` to drop it, or a non-empty list to replace it. Both camelCase and snake_case keys are accepted. See [Feishu AI Agent](./guides/feishu-ai-agent.md#qr-login-scopes-and-events).
 
