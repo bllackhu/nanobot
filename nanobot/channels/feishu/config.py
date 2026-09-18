@@ -35,10 +35,10 @@ class FeishuConfig(Base):
     live_tool_hint_min_dwell_ms: int = Field(default=800, ge=0, le=2000)
     live_tool_hint_done_hold_ms: int = Field(default=200, ge=0, le=2000)
     live_tool_hint_elapsed_after_ms: int = Field(default=3000, ge=0, le=600000)
-    # Circuit breaker for the live hint heartbeat: after this many consecutive
-    # CardKit update failures, the card is treated as dead (Feishu can kill the
-    # streaming session, e.g. code=200850 "card streaming timeout") and the
-    # heartbeat stops hammering it. A single success resets the counter.
+    # Circuit breaker for non-fatal live-hint heartbeat failures. Fatal
+    # CardKit codes 200850 (streaming timeout) and 300309 (streaming mode
+    # closed) retire the card on the first response instead of waiting for
+    # this count — reopening streaming_mode would start another 10-minute window.
     live_tool_hint_max_consecutive_failures: int = Field(default=5, ge=1, le=50)
     group_policy: Literal["open", "mention", "listen"] = "mention"
     reply_to_message: bool = False

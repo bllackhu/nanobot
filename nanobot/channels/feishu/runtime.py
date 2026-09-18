@@ -959,6 +959,7 @@ class _FeishuStreamBuf:
 
     text: str = ""
     card_id: str | None = None
+    chat_id: str = ""  # owning chat, so turn-end can find a message_id-keyed card
     message_id: str | None = None  # chat message id (om_…) when the live card was sent
     sequence: int = 0
     last_edit: float = 0.0
@@ -1041,6 +1042,10 @@ class FeishuChannel(BaseChannel):
         self._live_hint_bufs: dict[str, _FeishuStreamBuf] = {}
         self._live_hint_heartbeat_tasks: dict[str, asyncio.Task] = {}
         self._live_hint_finalized: set[str] = set()
+        # CardKit ids whose streaming session is dead (200850 / 300309).
+        # Content writes on these ids are refused so a leftover heartbeat
+        # cannot reopen streaming_mode and burn another 10-minute window.
+        self._dead_card_ids: set[str] = set()
         self._bot_open_id: str | None = None
         self._background_tasks: set[asyncio.Task] = set()
         self._reaction_ids: dict[str, str] = {}  # message_id → reaction_id
@@ -2264,16 +2269,29 @@ class FeishuChannel(BaseChannel):
             self.logger.warning("Error creating streaming card: {}", e)
             return None
 
+    # Feishu closes streaming 10 minutes after the last ``streaming_mode: true``.
+    # 200850: that window expired. 300309: mode is already closed. Setting
+    # streaming_mode true again starts another 10-minute window.
+    _FATAL_CARD_ERROR_CODES = frozenset({200850, 300309})
+
     @classmethod
     def _fatal_card_error_code(cls, code: int) -> bool:
         """True when a CardKit error means the streaming session is dead.
 
-        Feishu kills the streaming session when it times out (code 200850);
-        after that any content/settings update on the card keeps failing, so
-        retrying only burns API quota. Treat this as fatal so the caller can
-        stop re-arming / stop re-sending on the dead card.
+        Feishu kills the streaming session when it times out (code 200850) or
+        reports that streaming mode is already closed (code 300309). After
+        that any content update keeps failing, and turning streaming mode
+        back on only starts another 10-minute window. Treat both as fatal so
+        the caller can drop the card instead of retrying.
         """
-        return code == 200850
+        return code in cls._FATAL_CARD_ERROR_CODES
+
+    def _card_is_dead(self, card_id: str | None) -> bool:
+        return bool(card_id) and card_id in self._dead_card_ids
+
+    def _mark_card_dead(self, card_id: str | None) -> None:
+        if card_id:
+            self._dead_card_ids.add(card_id)
 
     def _stream_update_text_sync(self, card_id: str, content: str, sequence: int) -> tuple[bool, int | None]:
         """Stream-update the markdown element on a CardKit card (typewriter effect).
@@ -2363,20 +2381,25 @@ class FeishuChannel(BaseChannel):
         content: str,
         sequence: int,
     ) -> tuple[bool, int]:
+        if self._card_is_dead(card_id):
+            return False, sequence
         ok, err_code = self._stream_update_text_sync(card_id, content, sequence)
         if ok:
             return True, sequence
-        # A fatal card error (e.g. 200850: the streaming session timed out /
-        # was killed) means the card is dead; re-enabling streaming mode and
-        # re-sending only burns quota. Skip the reopen+retry and let the caller
-        # decide (heartbeat circuit breaker, fallback to a regular card, etc.).
+        # 200850 / 300309: the streaming session is dead. Re-enabling
+        # streaming_mode starts another 10-minute Feishu window and the
+        # follow-up content write fails, so skip that retry entirely.
         if err_code is not None and self._fatal_card_error_code(err_code):
+            self._mark_card_dead(card_id)
             return False, sequence
         sequence += 1
         if not self._set_streaming_mode_sync(card_id, True, sequence):
             return False, sequence
         sequence += 1
-        return self._stream_update_text_sync(card_id, content, sequence)[0], sequence
+        ok, retry_code = self._stream_update_text_sync(card_id, content, sequence)
+        if not ok and retry_code is not None and self._fatal_card_error_code(retry_code):
+            self._mark_card_dead(card_id)
+        return ok, sequence
 
     async def send_delta(
         self,
@@ -2433,8 +2456,10 @@ class FeishuChannel(BaseChannel):
                 return
             # Try to finalize via streaming card; if that fails (e.g.
             # streaming mode was closed by Feishu due to timeout), fall
-            # back to sending a regular interactive card.
-            if buf.card_id:
+            # back to sending a regular interactive card. A card already
+            # marked dead is not written again — that write is what restarts
+            # Feishu's 10-minute streaming window.
+            if buf.card_id and not self._card_is_dead(buf.card_id):
                 buf.sequence += 1
                 ok, buf.sequence = await loop.run_in_executor(
                     None,
@@ -2443,7 +2468,12 @@ class FeishuChannel(BaseChannel):
                     buf.text,
                     buf.sequence,
                 )
-                if ok:
+                if self._card_is_dead(buf.card_id):
+                    self.logger.warning(
+                        "Streaming card {} is dead, falling back to regular card",
+                        buf.card_id,
+                    )
+                elif ok:
                     buf.sequence += 1
                     closed = await loop.run_in_executor(
                         None,
@@ -2460,17 +2490,18 @@ class FeishuChannel(BaseChannel):
                             buf.sequence,
                         )
                     return
-                buf.sequence += 1
-                await loop.run_in_executor(
-                    None,
-                    self._close_streaming_mode_sync,
-                    buf.card_id,
-                    buf.sequence,
-                )
-                self.logger.warning(
-                    "Streaming card {} final update failed, falling back to regular card",
-                    buf.card_id,
-                )
+                else:
+                    buf.sequence += 1
+                    await loop.run_in_executor(
+                        None,
+                        self._close_streaming_mode_sync,
+                        buf.card_id,
+                        buf.sequence,
+                    )
+                    self.logger.warning(
+                        "Streaming card {} final update failed, falling back to regular card",
+                        buf.card_id,
+                    )
             for chunk in self._split_elements_by_table_limit(
                 self._build_card_elements(buf.text)
             ):
@@ -2528,10 +2559,18 @@ class FeishuChannel(BaseChannel):
                     buf.message_id = _msg_id
                     buf.sequence = sequence
                     buf.last_edit = now
+                elif self._card_is_dead(card_id):
+                    # Keep the dead id so the next delta does not open a new
+                    # streaming card every edit interval.
+                    buf.card_id = card_id
+                    buf.message_id = _msg_id
+                    buf.sequence = sequence
                 else:
                     await loop.run_in_executor(
                         None, self._close_streaming_mode_sync, card_id, sequence + 1
                     )
+        elif self._card_is_dead(buf.card_id):
+            return
         elif (now - buf.last_edit) >= self._STREAM_EDIT_INTERVAL:
             ok, buf.sequence = await loop.run_in_executor(
                 None,
@@ -2542,7 +2581,7 @@ class FeishuChannel(BaseChannel):
             )
             if ok:
                 buf.last_edit = now
-            else:
+            elif not self._card_is_dead(buf.card_id):
                 buf.sequence += 1
                 await loop.run_in_executor(
                     None,
@@ -3235,6 +3274,8 @@ class FeishuChannel(BaseChannel):
         sequence: int,
     ) -> bool:
         """One CardKit content write; always harvest the sequence, even if cancelled."""
+        if self._card_is_dead(card_id):
+            return False
         fut = loop.run_in_executor(
             None, self._stream_update_text_with_reopen_sync, card_id, content, sequence
         )
@@ -3266,7 +3307,11 @@ class FeishuChannel(BaseChannel):
         pre-flushes the previous payload, so a lone wrench glyph cannot stick
         as the visible line between thinking and the first tool hint.
         ``delay`` still seeds so non-prefix replaces can typewrite.
+        A fatal seed write (200850 / 300309) must not be followed by the full
+        content write — that second call is the quota leak.
         """
+        if self._card_is_dead(card_id):
+            return False
         if (
             self.config.live_tool_hint_print_strategy != "fast"
             and self._needs_live_stream_reset(buf.last_payload, content)
@@ -3276,6 +3321,8 @@ class FeishuChannel(BaseChannel):
                 ok = await self._write_live_card_content(
                     buf, loop, card_id, seed, sequence
                 )
+                if self._card_is_dead(card_id):
+                    return False
                 sequence = buf.sequence + 1 if ok else max(sequence, buf.sequence) + 1
         return await self._write_live_card_content(buf, loop, card_id, content, sequence)
 
@@ -3451,7 +3498,7 @@ class FeishuChannel(BaseChannel):
             ):
                 # Stale thinking after turn-end finalize — do not reopen the card.
                 return
-            buf = _FeishuStreamBuf()
+            buf = _FeishuStreamBuf(chat_id=chat_id)
             self._live_hint_bufs[stream_key] = buf
 
         while True:
@@ -3465,6 +3512,7 @@ class FeishuChannel(BaseChannel):
                     # Finalized or cleared while we waited — do not reopen.
                     return
                 buf = live
+                buf.chat_id = chat_id
                 now = time.monotonic()
                 if thinking_status:
                     thinking_wait = self._live_thinking_wait_until(buf, now=now)
@@ -3536,17 +3584,26 @@ class FeishuChannel(BaseChannel):
                             buf.last_heartbeat = committed_at
                             buf.last_line_write = committed_at
                         else:
-                            await loop.run_in_executor(
-                                None, self._close_streaming_mode_sync, card_id, buf.sequence + 1
-                            )
+                            if self._card_is_dead(card_id):
+                                self._drop_live_hint_stream(stream_key)
+                            else:
+                                await loop.run_in_executor(
+                                    None, self._close_streaming_mode_sync, card_id, buf.sequence + 1
+                                )
+                            return
                     elif should_write:
+                        live_card_id = buf.card_id
                         ok = await self._commit_live_card_content(
-                            buf, loop, buf.card_id, line, buf.sequence + 1
+                            buf, loop, live_card_id, line, buf.sequence + 1
                         )
                         if ok:
                             committed_at = time.monotonic()
                             buf.last_edit = committed_at
                             buf.last_line_write = committed_at
+                        else:
+                            if self._card_is_dead(live_card_id):
+                                self._drop_live_hint_stream(stream_key)
+                            return
                     self._arm_live_hint_heartbeat(chat_id, stream_key)
                     return
 
@@ -3563,6 +3620,34 @@ class FeishuChannel(BaseChannel):
                 return
             buf = nxt
 
+    def _drop_live_hint_stream(self, stream_key: str) -> None:
+        """Forget a live card and stop its heartbeat. Does not mark the turn finalized."""
+        self._live_hint_bufs.pop(stream_key, None)
+        self._cancel_live_hint_heartbeat(stream_key)
+
+    def _resolve_live_hint_keys(
+        self, chat_id: str, metadata: dict[str, Any] | None
+    ) -> list[str]:
+        """Stream keys whose live card should freeze with this turn.
+
+        Cron finals often have no ``message_id``, so the lookup key is
+        ``chat_id`` while the card was stored under the trigger message id.
+        """
+        stream_key = self._stream_key(chat_id, metadata)
+        keys: list[str] = []
+        primary = self._live_hint_bufs.get(stream_key)
+        if primary and primary.card_id:
+            keys.append(stream_key)
+        if stream_key != chat_id:
+            alt = self._live_hint_bufs.get(chat_id)
+            if alt and alt.card_id and chat_id not in keys:
+                keys.append(chat_id)
+        if stream_key == chat_id and not keys:
+            for key, candidate in self._live_hint_bufs.items():
+                if key != chat_id and candidate.chat_id == chat_id and candidate.card_id:
+                    keys.append(key)
+        return keys
+
     async def _finalize_live_hint_card(
         self, chat_id: str, metadata: dict[str, Any] | None
     ) -> None:
@@ -3571,15 +3656,19 @@ class FeishuChannel(BaseChannel):
         Thinking lines become ``AI thinking - done``; tool lines swap
         ``processing`` → ``done``. Heartbeat is cancelled so the card stops pulsing.
         """
-        stream_key = self._stream_key(chat_id, metadata)
+        keys = self._resolve_live_hint_keys(chat_id, metadata)
+        if not keys:
+            stream_key = self._stream_key(chat_id, metadata)
+            self._cancel_live_hint_heartbeat(stream_key)
+            self._live_hint_bufs.pop(stream_key, None)
+            self._live_hint_finalized.add(stream_key)
+            self._live_hint_finalized.add(chat_id)
+            return
+        for stream_key in keys:
+            await self._finalize_one_live_hint_card(chat_id, stream_key)
+
+    async def _finalize_one_live_hint_card(self, chat_id: str, stream_key: str) -> None:
         buf = self._live_hint_bufs.get(stream_key)
-        # Fallback when stream_end metadata lacks message_id but the live card
-        # was keyed by chat_id (or the reverse).
-        if (not buf or not buf.card_id) and stream_key != chat_id:
-            alt = self._live_hint_bufs.get(chat_id)
-            if alt and alt.card_id:
-                stream_key = chat_id
-                buf = alt
         if not buf or not buf.card_id:
             self._cancel_live_hint_heartbeat(stream_key)
             self._live_hint_bufs.pop(stream_key, None)
@@ -3598,16 +3687,19 @@ class FeishuChannel(BaseChannel):
             self._live_hint_finalized.add(chat_id)
             buf.elapsed_started_at = 0.0
             buf.tool_in_flight = False
+            if self._card_is_dead(buf.card_id):
+                return
             if buf.text:
                 buf.text = self._finalize_live_hint_text(buf)
                 ok = await self._commit_live_card_content(
                     buf, loop, buf.card_id, buf.text, buf.sequence + 1
                 )
-                if not ok:
-                    buf.sequence += 1
-                    await loop.run_in_executor(
-                        None, self._close_streaming_mode_sync, buf.card_id, buf.sequence
-                    )
+                if not ok or self._card_is_dead(buf.card_id):
+                    if not self._card_is_dead(buf.card_id):
+                        buf.sequence += 1
+                        await loop.run_in_executor(
+                            None, self._close_streaming_mode_sync, buf.card_id, buf.sequence
+                        )
                     return
             buf.sequence += 1
             closed = await loop.run_in_executor(
@@ -3715,24 +3807,34 @@ class FeishuChannel(BaseChannel):
                 ok = await self._commit_live_card_content(
                     buf, loop, buf.card_id, content, buf.sequence + 1
                 )
+            dead_card = buf.card_id if self._card_is_dead(buf.card_id) else None
             if ok:
                 consecutive_failures = 0
                 buf.last_heartbeat = time.monotonic()
+            elif dead_card:
+                # 200850 / 300309: Feishu closed the streaming session. Drop the
+                # card on this tick. Re-enabling streaming_mode would start
+                # another 10-minute window and keep burning quota.
+                self.logger.warning(
+                    "Live hint card {} stopped: streaming session closed ({})",
+                    stream_key,
+                    dead_card,
+                )
+                self._drop_live_hint_stream(stream_key)
+                return
             else:
                 consecutive_failures += 1
                 if consecutive_failures >= max_failures:
-                    # Feishu likely killed the streaming session (e.g.
-                    # code=200850 card streaming timeout). Treat the card as
-                    # dead: drop its buffer so the loop exits and the next
-                    # tool/thinking hint creates a fresh card. Do NOT mark the
-                    # stream finalized — the turn is still running.
+                    # Non-fatal failures (network, 300317, …). Drop the buffer
+                    # so the loop exits and the next tool/thinking hint creates
+                    # a fresh card. Do NOT mark the stream finalized — the turn
+                    # is still running.
                     self.logger.warning(
                         "Live hint card {} stopped after {} consecutive update failures",
                         stream_key,
                         consecutive_failures,
                     )
-                    self._live_hint_bufs.pop(stream_key, None)
-                    self._cancel_live_hint_heartbeat(stream_key)
+                    self._drop_live_hint_stream(stream_key)
                     return
             next_tick += interval
             now = time.monotonic()
