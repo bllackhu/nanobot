@@ -677,7 +677,7 @@ async def test_on_message_new_system_divider_only_in_p2p(
         channel._send_message_sync.assert_not_called()
         return
     _, receive_id, msg_type, content = channel._send_message_sync.call_args.args
-    assert receive_id == "ou_alice"
+    assert receive_id == "oc_abc"
     assert msg_type == "system"
     payload = json.loads(content)
     assert payload["type"] == "divider"
@@ -701,11 +701,38 @@ async def test_on_message_new_phrase_system_divider_in_p2p(text: str) -> None:
     channel._handle_message.assert_awaited_once()
     assert channel._handle_message.call_args.kwargs["content"] == text
     _, receive_id, msg_type, content = channel._send_message_sync.call_args.args
-    assert receive_id == "ou_alice"
+    assert receive_id == "oc_abc"
     assert msg_type == "system"
     payload = json.loads(content)
     assert payload["type"] == "divider"
     assert payload["params"]["divider_text"]["text"] == "New session started."
+
+
+@pytest.mark.asyncio
+async def test_on_message_p2p_reply_targets_conversation_chat_id() -> None:
+    """p2p replies must target the DM's oc_ chat_id, not the sender open_id.
+
+    Feishu rejects sending to a user's open_id with error 230101, so the
+    conversation chat_id has to be used while the sender open_id is kept for
+    authorization and session identity.
+    """
+    channel = _make_feishu_channel()
+    channel._processed_message_ids.clear()
+    channel._handle_message = AsyncMock()
+
+    with patch.object(channel, "_add_reaction", return_value=None):
+        await channel._on_message(_make_feishu_event(
+            chat_type="p2p",
+            chat_id="oc_dm123",
+            sender_open_id="ou_alice",
+            content='{"text": "hello"}',
+        ))
+
+    channel._handle_message.assert_awaited_once()
+    kwargs = channel._handle_message.call_args.kwargs
+    assert kwargs["sender_id"] == "ou_alice"
+    assert kwargs["chat_id"] == "oc_dm123"
+    assert kwargs["is_dm"] is True
 
 
 @pytest.mark.parametrize("confirm", ["New session started.", "已开启新对话"])
@@ -766,7 +793,7 @@ async def test_on_message_custom_started_message_divider_in_p2p() -> None:
         ))
 
     _, receive_id, msg_type, content = channel._send_message_sync.call_args.args
-    assert receive_id == "ou_alice"
+    assert receive_id == "oc_abc"
     assert msg_type == "system"
     payload = json.loads(content)
     assert payload["type"] == "divider"

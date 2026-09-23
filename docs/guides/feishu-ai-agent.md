@@ -121,6 +121,13 @@ After approval, DM the bot again or mention it in a group chat:
   mode, and `nanobot gateway --verbose`.
 - If a first DM returns a pairing code, approve it before testing normal
   replies.
+- If DM replies fail with `code=230101` (`Sending messages to users is
+  temporarily unavailable`), the bot is trying to send to the sender's
+  `open_id` (`ou_...`). Feishu rejects that for these apps; replies must target
+  the direct-message conversation's `chat_id` (`oc_...`). Upgrade nanobot to a
+  build that delivers p2p replies to the conversation `chat_id` (the sender
+  `open_id` is still used for authorization and pairing). As an interim
+  workaround, set `"replyToMessage": true` so text replies use the Reply API.
 
 ## QR login scopes and events
 

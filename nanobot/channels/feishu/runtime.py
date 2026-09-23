@@ -2875,7 +2875,7 @@ class FeishuChannel(BaseChannel):
                     # BaseChannel._handle_message, not from the original message.
                     await self._handle_message(
                         sender_id=sender_id,
-                        chat_id=sender_id,
+                        chat_id=chat_id,
                         content="",
                         is_dm=True,
                     )
@@ -2996,8 +2996,8 @@ class FeishuChannel(BaseChannel):
                 await loop.run_in_executor(
                     None,
                     self._send_message_sync,
-                    "open_id",
-                    sender_id,
+                    "chat_id",
+                    chat_id,
                     "system",
                     _new_session_divider_content(confirm),
                 )
@@ -3014,8 +3014,12 @@ class FeishuChannel(BaseChannel):
             else:
                 session_key = None
 
-            # Forward to message bus
-            reply_to = chat_id if chat_type == "group" else sender_id
+            # Forward to message bus. Always deliver to the conversation
+            # chat_id: for p2p this is the DM's ``oc_`` id. Feishu rejects
+            # sending to a user's ``open_id`` for these bots (error 230101),
+            # while the sender's open_id is still kept for authorization and
+            # pairing identity.
+            reply_to = chat_id
             metadata: dict[str, Any] = {
                 "message_id": message_id,
                 "chat_type": chat_type,
