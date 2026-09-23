@@ -31,7 +31,7 @@ Whole-message aliases for `/new` can also start a fresh session. By default thes
 
 After a reset, the bot replies with [`agents.defaults.newSessionStartedMessage`](./configuration.md#new-session-phrases) (default `New session started.`). An empty value skips the confirmation.
 
-If the last assistant reply was more than [`idleNewSessionHintAfterHours`](./configuration.md#new-session-phrases) ago (default 8), the next user turn also gets a one-shot reminder from [`idleNewSessionHintMessage`](./configuration.md#new-session-phrases) before the agent answers. It does not start a new session by itself.
+If the last assistant reply was more than [`idleNewSessionHintAfterHours`](./configuration.md#new-session-phrases) ago (disabled by default; set a positive number of hours to enable), the next user turn also gets a one-shot reminder from [`idleNewSessionHintMessage`](./configuration.md#new-session-phrases) before the agent answers. It does not start a new session by itself.
 
 ## Pairing
 

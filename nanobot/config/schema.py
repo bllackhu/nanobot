@@ -184,14 +184,14 @@ class AgentDefaults(Base):
         serialization_alias="newSessionStartedMessage",
     )  # Confirmation text sent after /new; empty string skips the reply
     idle_new_session_hint_after_hours: float = Field(
-        default=8,
+        default=0,
         ge=0,
         validation_alias=AliasChoices(
             "idleNewSessionHintAfterHours",
             "idle_new_session_hint_after_hours",
         ),
         serialization_alias="idleNewSessionHintAfterHours",
-    )  # Hours since last assistant reply before the idle hint; 0 disables; fractions allowed
+    )  # Hours since last assistant reply before the idle hint; 0 disables (default); fractions allowed
     idle_new_session_hint_message: str = Field(
         default=DEFAULT_IDLE_NEW_SESSION_HINT_MESSAGE,
         validation_alias=AliasChoices(

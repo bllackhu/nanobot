@@ -50,10 +50,10 @@ def test_new_session_started_message_default_and_alias() -> None:
 
 def test_idle_new_session_hint_defaults_and_alias() -> None:
     defaults = AgentDefaults()
-    assert defaults.idle_new_session_hint_after_hours == 8
+    assert defaults.idle_new_session_hint_after_hours == 0
     assert defaults.idle_new_session_hint_message == DEFAULT_IDLE_NEW_SESSION_HINT_MESSAGE
     dumped = AgentDefaults().model_dump(by_alias=True)
-    assert dumped["idleNewSessionHintAfterHours"] == 8
+    assert dumped["idleNewSessionHintAfterHours"] == 0
     assert dumped["idleNewSessionHintMessage"] == DEFAULT_IDLE_NEW_SESSION_HINT_MESSAGE
 
     parsed = AgentDefaults.model_validate({

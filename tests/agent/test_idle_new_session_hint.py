@@ -19,6 +19,8 @@ HINT = "It's been a while. Start a new session if you want a clean context."
 
 def _make_full_loop(tmp_path: Path, **kwargs) -> AgentLoop:
     kwargs.setdefault("idle_new_session_hint_message", HINT)
+    # The schema default is 0 (disabled); these tests exercise the enabled path.
+    kwargs.setdefault("idle_new_session_hint_after_hours", 8)
     provider = MagicMock()
     provider.get_default_model.return_value = "test-model"
     provider.generation = SimpleNamespace(max_tokens=4096)
