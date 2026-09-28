@@ -468,3 +468,68 @@ async def test_runner_blocks_repeated_external_fetches():
         if msg.get("role") == "tool" and msg.get("tool_call_id") == "call_3"
     ][0]
     assert "repeated external lookup blocked" in blocked_tool_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_runner_blocks_sixth_identical_grep_and_allows_a_changed_pattern():
+    provider = MagicMock()
+    captured_final_call: list[dict] = []
+    executed: list[dict] = []
+    call_count = {"n": 0}
+    same = {"path": "notes.md", "pattern": "^# ", "head_limit": 40}
+
+    async def chat_with_retry(*, messages, **kwargs):
+        call_count["n"] += 1
+        n = call_count["n"]
+        if n <= 6:
+            return LLMResponse(
+                content="working",
+                tool_calls=[ToolCallRequest(
+                    id=f"call_{n}",
+                    name="grep",
+                    arguments=dict(same),
+                )],
+                usage={},
+            )
+        if n == 7:
+            return LLMResponse(
+                content="working",
+                tool_calls=[ToolCallRequest(
+                    id="call_7",
+                    name="grep",
+                    arguments={"path": "notes.md", "pattern": "palette", "head_limit": 40},
+                )],
+                usage={},
+            )
+        captured_final_call[:] = messages
+        return LLMResponse(content="done", tool_calls=[], usage={})
+
+    async def execute(name, params):
+        executed.append(dict(params))
+        return "match"
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = execute
+
+    result = await AgentRunner().run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "find headings"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=8,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.final_content == "done"
+    assert executed == [same, same, same, same, same, {
+        "path": "notes.md",
+        "pattern": "palette",
+        "head_limit": 40,
+    }]
+    blocked_tool_message = [
+        msg for msg in captured_final_call
+        if msg.get("role") == "tool" and msg.get("tool_call_id") == "call_6"
+    ][0]
+    assert "this exact call already ran" in blocked_tool_message["content"]
+    assert "read_file" in blocked_tool_message["content"]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,11 @@ from loguru import logger
 from nanobot.utils.helpers import stringify_text_blocks
 
 _MAX_REPEAT_EXTERNAL_LOOKUPS = 2
+
+# Sixth identical grep/exec call in a turn is blocked. Five leaves room
+# for a flaky exec retry without letting a deterministic grep loop fill context.
+_MAX_IDENTICAL_CALLS = 5
+_IDENTICAL_CALL_TOOLS = frozenset({"grep", "exec"})
 
 # Third same-target workspace violation in a turn escalates to "stop retrying".
 _MAX_REPEAT_WORKSPACE_VIOLATIONS = 2
@@ -125,6 +131,48 @@ def repeated_external_lookup_error(
     return (
         "Error: repeated external lookup blocked. "
         "Use the results you already have to answer, or try a meaningfully different source."
+    )
+
+
+def identical_call_signature(tool_name: str, arguments: Any) -> str | None:
+    """Stable signature for grep/exec calls that must not loop unchanged."""
+    if tool_name not in _IDENTICAL_CALL_TOOLS:
+        return None
+    if isinstance(arguments, dict):
+        payload = json.dumps(
+            arguments,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        )
+    else:
+        payload = json.dumps(arguments, ensure_ascii=False, default=str)
+    return f"{tool_name}:{payload}"
+
+
+def repeated_identical_call_error(
+    tool_name: str,
+    arguments: Any,
+    seen_counts: dict[str, int],
+) -> str | None:
+    """Block the 6th identical grep or exec call in one turn."""
+    signature = identical_call_signature(tool_name, arguments)
+    if signature is None:
+        return None
+    count = seen_counts.get(signature, 0) + 1
+    seen_counts[signature] = count
+    if count <= _MAX_IDENTICAL_CALLS:
+        return None
+    logger.warning(
+        "Blocking identical {} call on attempt {}",
+        tool_name,
+        count,
+    )
+    return (
+        "Error: this exact call already ran. "
+        "Change the tool or the arguments. "
+        "For a source file, use read_file with offset and limit once."
     )
 
 
