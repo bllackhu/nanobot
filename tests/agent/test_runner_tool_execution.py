@@ -533,3 +533,160 @@ async def test_runner_blocks_sixth_identical_grep_and_allows_a_changed_pattern()
     ][0]
     assert "this exact call already ran" in blocked_tool_message["content"]
     assert "read_file" in blocked_tool_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_runner_stops_when_blocked_exec_is_requested_again():
+    provider = MagicMock()
+    executed: list[dict] = []
+    tool_rounds = {"n": 0}
+    no_tools_calls = {"n": 0}
+    same = {"command": "python3 -c 'print(1)'"}
+
+    async def chat_with_retry(*, messages, tools=None, **kwargs):
+        if tools is None:
+            no_tools_calls["n"] += 1
+            return LLMResponse(content="stopped after the repeat", tool_calls=[], usage={})
+        tool_rounds["n"] += 1
+        n = tool_rounds["n"]
+        if n <= 7:
+            return LLMResponse(
+                content="working",
+                tool_calls=[ToolCallRequest(
+                    id=f"call_{n}",
+                    name="exec",
+                    arguments=dict(same),
+                )],
+                usage={},
+            )
+        raise AssertionError("tool loop continued after the repeated block")
+
+    async def execute(name, params):
+        executed.append(dict(params))
+        return "ok"
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = [{"name": "exec"}]
+    tools.execute = execute
+
+    result = await AgentRunner().run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "probe fonts"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=12,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert executed == [same, same, same, same, same]
+    assert tool_rounds["n"] == 7
+    assert no_tools_calls["n"] == 1
+    assert result.final_content == "stopped after the repeat"
+    assert result.stop_reason == "identical_call_blocked"
+
+
+@pytest.mark.asyncio
+async def test_runner_repeated_block_uses_fallback_when_finalization_requests_tools():
+    provider = MagicMock()
+    executed: list[str] = []
+    tool_rounds = {"n": 0}
+    no_tools_calls = {"n": 0}
+    same = {"command": "python3 -c 'print(1)'"}
+
+    async def chat_with_retry(*, messages, tools=None, **kwargs):
+        if tools is None:
+            no_tools_calls["n"] += 1
+            return LLMResponse(
+                content="",
+                tool_calls=[ToolCallRequest(id="again", name="exec", arguments=dict(same))],
+                usage={},
+            )
+        tool_rounds["n"] += 1
+        n = tool_rounds["n"]
+        if n <= 7:
+            return LLMResponse(
+                content="working",
+                tool_calls=[ToolCallRequest(
+                    id=f"call_{n}",
+                    name="exec",
+                    arguments=dict(same),
+                )],
+                usage={},
+            )
+        raise AssertionError("tool loop continued after the repeated block")
+
+    async def execute(name, params):
+        executed.append(params["command"])
+        return "ok"
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = [{"name": "exec"}]
+    tools.execute = execute
+
+    result = await AgentRunner().run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "probe fonts"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=12,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert len(executed) == 5
+    assert tool_rounds["n"] == 7
+    assert no_tools_calls["n"] == 1
+    assert "requested again" in (result.final_content or "")
+    assert result.stop_reason == "identical_call_blocked"
+
+
+@pytest.mark.asyncio
+async def test_runner_runs_different_exec_after_identical_block():
+    provider = MagicMock()
+    executed: list[str] = []
+    call_count = {"n": 0}
+    same = {"command": "python3 -c 'print(1)'"}
+
+    async def chat_with_retry(*, messages, **kwargs):
+        call_count["n"] += 1
+        n = call_count["n"]
+        if n <= 6:
+            return LLMResponse(
+                content="working",
+                tool_calls=[ToolCallRequest(
+                    id=f"call_{n}",
+                    name="exec",
+                    arguments=dict(same),
+                )],
+                usage={},
+            )
+        if n == 7:
+            return LLMResponse(
+                content="working",
+                tool_calls=[ToolCallRequest(
+                    id="call_7",
+                    name="exec",
+                    arguments={"command": "python3 svg_quality_checker.py"},
+                )],
+                usage={},
+            )
+        return LLMResponse(content="done", tool_calls=[], usage={})
+
+    async def execute(name, params):
+        executed.append(params["command"])
+        return "ok"
+
+    provider.chat_with_retry = chat_with_retry
+    tools = MagicMock()
+    tools.get_definitions.return_value = []
+    tools.execute = execute
+
+    result = await AgentRunner().run(make_run_spec(provider,
+        initial_messages=[{"role": "user", "content": "check svg"}],
+        tools=tools,
+        model="test-model",
+        max_iterations=8,
+        max_tool_result_chars=_MAX_TOOL_RESULT_CHARS,
+    ))
+
+    assert result.final_content == "done"
+    assert executed == ["python3 -c 'print(1)'"] * 5 + ["python3 svg_quality_checker.py"]
