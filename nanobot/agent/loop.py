@@ -482,6 +482,7 @@ class AgentLoop:
             consolidation_ratio=consolidation_ratio,
             unified_session=unified_session,
             on_status=self._consolidation_status,
+            file_state_store=self._file_state_store,
         )
         self.auto_compact = AutoCompact(
             sessions=self.sessions,

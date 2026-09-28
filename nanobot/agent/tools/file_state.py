@@ -125,6 +125,15 @@ class FileStates:
         """Return the raw ReadState entry for a path, or None."""
         return self._state.get(str(Path(path).resolve()))
 
+    def drop_read_dedup(self) -> None:
+        """Return file bodies on the next read without dropping read-before-edit.
+
+        History consolidation removes tool output from the transcript. The
+        next ``read_file`` must not answer with an empty unchanged stub.
+        """
+        for entry in self._state.values():
+            entry.can_dedup = False
+
     def clear(self) -> None:
         """Clear all tracked state (useful for testing)."""
         self._state.clear()
