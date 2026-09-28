@@ -28,7 +28,7 @@ Tool signatures are provided automatically via function calling. This section do
 - Use `apply_patch dry_run=true` when the patch is uncertain and you want validation plus a change summary before writing.
 - Use `edit_file` only for small exact replacements in one file, with `old_text` copied from `read_file`; when editing a specific numbered line, pass that exact line as `line_hint`; add `occurrence` or `expected_replacements` when ambiguity matters.
 - Use `write_file` for new files or intentional full-file rewrites, not routine partial edits.
-- If `apply_patch` or `edit_file` fails, re-read with `force=true`, narrow the context, and try a smaller patch rather than switching to shell `sed` or `echo`.
+- If `apply_patch` or `edit_file` fails, narrow the context and try a smaller patch rather than re-reading an unchanged file or switching to shell `sed` or `echo`.
 
 ## Process Execution
 

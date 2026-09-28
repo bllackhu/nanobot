@@ -226,7 +226,10 @@ def _builtin_skill_read_path(path: str) -> Path | None:
         ),
         pages=StringSchema("Page range for PDF files, e.g. '1-5' (default: all, max 20 pages)"),
         force=BooleanSchema(
-            description="Bypass same-file read deduplication and return content again.",
+            description=(
+                "Accepted for older callers. An unchanged file still returns "
+                "the short stub instead of the body."
+            ),
             default=False,
         ),
         required=["path"],
@@ -255,7 +258,7 @@ class ReadFileTool(_FsTool):
             "Read the relevant range before editing so replacements or patches "
             "are based on current content. "
             "Use offset and limit for large text files. "
-            "Use force=true to re-read content even if unchanged. "
+            "An unchanged file returns a short stub instead of the body again. "
             "Reads exceeding ~128K chars are truncated."
         )
 
@@ -306,16 +309,16 @@ class ReadFileTool(_FsTool):
             if mime and mime.startswith("image/"):
                 return build_image_content_blocks(raw, mime, str(fp), f"(Image file: {path})")
 
-            # Read dedup: same path + offset + limit + unchanged mtime → stub
-            # Always check for external modifications before dedup
+            # Read dedup: same path + offset + limit + unchanged content → stub.
+            # force does not bypass this. After history consolidation can_dedup
+            # is false, so the next read still returns the body once.
             entry = self._file_states.get(fp)
             try:
                 current_mtime = os.path.getmtime(fp)
             except OSError:
                 current_mtime = 0.0
             if (
-                not force
-                and entry
+                entry
                 and entry.can_dedup
                 and entry.offset == offset
                 and entry.limit == limit
@@ -332,7 +335,8 @@ class ReadFileTool(_FsTool):
                     if current_hash == entry.content_hash:
                         return (
                             f"[File unchanged since last read: {path}. "
-                            "The body was omitted. Pass force=true to read it again.]"
+                            "The body was already returned. Do not read this path again. "
+                            "Continue with a different tool.]"
                         )
                     else:
                         # Content changed despite same mtime - force full read
