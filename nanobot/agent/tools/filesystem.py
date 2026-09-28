@@ -330,7 +330,10 @@ class ReadFileTool(_FsTool):
                     # But only if content is actually unchanged (not just mtime)
                     current_hash = _hash_file(str(fp))
                     if current_hash == entry.content_hash:
-                        return f"[File unchanged since last read: {path}]"
+                        return (
+                            f"[File unchanged since last read: {path}. "
+                            "The body was omitted. Pass force=true to read it again.]"
+                        )
                     else:
                         # Content changed despite same mtime - force full read
                         entry.can_dedup = False

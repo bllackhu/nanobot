@@ -4,6 +4,8 @@ import pytest
 
 import nanobot.agent.memory as memory_module
 from nanobot.agent.loop import AgentLoop
+from nanobot.agent.tools.file_state import bind_file_states, reset_file_states
+from nanobot.agent.tools.filesystem import ReadFileTool
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMResponse
 from nanobot.session.manager import replay_max_messages_for_context
@@ -325,4 +327,69 @@ async def test_same_turn_injects_working_recap_into_system_prompt(tmp_path, monk
     meta = loop.sessions.get_or_create("cli:test").metadata.get("_last_summary")
     assert meta is not None
     assert meta["text"] == recap
+
+
+@pytest.mark.asyncio
+async def test_consolidation_drops_read_dedup_and_keeps_read_record(tmp_path, monkeypatch) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=1000, context_window_tokens=200)
+    loop.consolidator.archive = AsyncMock(return_value="summary")  # type: ignore[method-assign]
+    note = tmp_path / "note.md"
+    note.write_text("palette A\n", encoding="utf-8")
+    states = loop._file_state_store.for_session("cli:test")
+    tool = ReadFileTool(workspace=tmp_path)
+
+    token = bind_file_states(states)
+    try:
+        first = await tool.execute(path=str(note))
+        stub = await tool.execute(path=str(note))
+    finally:
+        reset_file_states(token)
+    assert "palette A" in first
+    assert "force=true" in stub
+    assert states.check_read(note) is None
+
+    session = loop.sessions.get_or_create("cli:test")
+    session.messages = [
+        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
+        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
+        {"role": "user", "content": "u2", "timestamp": "2026-01-01T00:00:02"},
+    ]
+    loop.sessions.save(session)
+    monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _message: 500)
+
+    await loop.consolidator.maybe_consolidate_by_tokens(session, runtime=loop.llm_runtime())
+
+    entry = states.get(note)
+    assert entry is not None
+    assert entry.can_dedup is False
+    assert states.check_read(note) is None
+
+    token = bind_file_states(states)
+    try:
+        again = await tool.execute(path=str(note))
+    finally:
+        reset_file_states(token)
+    assert "palette A" in again
+    assert "force=true" not in again
+
+
+@pytest.mark.asyncio
+async def test_idle_token_check_keeps_read_dedup(tmp_path) -> None:
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=10_000)
+    note = tmp_path / "note.md"
+    note.write_text("palette A\n", encoding="utf-8")
+    states = loop._file_state_store.for_session("cli:test")
+    states.record_read(note)
+
+    session = loop.sessions.get_or_create("cli:test")
+    session.messages = [
+        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
+        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
+    ]
+    loop.sessions.save(session)
+
+    await loop.consolidator.maybe_consolidate_by_tokens(session, runtime=loop.llm_runtime())
+
+    assert states.get(note) is not None
+    assert states.get(note).can_dedup is True
 

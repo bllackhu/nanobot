@@ -55,6 +55,7 @@ class TestReadDedup:
         assert "line 0" in first
         second = await tool.execute(path=str(f))
         assert "unchanged" in second.lower()
+        assert "force=true" in second
         # Stub should not contain file content
         assert "line 0" not in second
 

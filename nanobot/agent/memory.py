@@ -37,6 +37,7 @@ from nanobot.utils.workspace_prompts import (
 )
 
 if TYPE_CHECKING:
+    from nanobot.agent.tools.file_state import FileStateStore
     from nanobot.utils.llm_runtime import LLMRuntime
 
 # Individual history.jsonl writers cap their own payloads tightly; the
@@ -779,6 +780,7 @@ class Consolidator:
         consolidation_ratio: float = 0.5,
         unified_session: bool = False,
         on_status: Callable[[str, str], Awaitable[None]] | None = None,
+        file_state_store: FileStateStore | None = None,
     ):
         self.store = store
         self.sessions = sessions
@@ -787,6 +789,7 @@ class Consolidator:
         self._build_messages = build_messages
         self._get_tool_definitions = get_tool_definitions
         self._on_status = on_status
+        self._file_state_store = file_state_store
         self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
@@ -794,6 +797,18 @@ class Consolidator:
     def get_lock(self, session_key: str) -> asyncio.Lock:
         """Return the shared consolidation lock for one session."""
         return self._locks.setdefault(session_key, asyncio.Lock())
+
+    def _drop_read_dedup(self, session_key: str) -> None:
+        """Drop empty re-read stubs after archived tool output leaves the transcript."""
+        store = self._file_state_store
+        if store is None:
+            return
+        store.for_session(session_key).drop_read_dedup()
+
+    def _drop_read_dedup_if_archived(self, session: Session, old_cursor: int) -> None:
+        if session.last_consolidated <= old_cursor:
+            return
+        self._drop_read_dedup(session.key)
 
     def pick_consolidation_boundary(
         self,
@@ -1216,6 +1231,7 @@ class Consolidator:
                 await self._apply_working_recap(
                     session, hidden, runtime=runtime, snip_fallback=last_snip,
                 )
+                self._drop_read_dedup_if_archived(session, old_cursor)
                 return
             if estimated < budget:
                 unconsolidated_count = len(session.messages) - session.last_consolidated
@@ -1231,6 +1247,7 @@ class Consolidator:
                 await self._apply_working_recap(
                     session, hidden, runtime=runtime, snip_fallback=last_snip,
                 )
+                self._drop_read_dedup_if_archived(session, old_cursor)
                 return
 
             rounds_done = 0
@@ -1305,6 +1322,7 @@ class Consolidator:
             await self._apply_working_recap(
                 session, hidden, runtime=runtime, snip_fallback=last_snip,
             )
+            self._drop_read_dedup_if_archived(session, old_cursor)
 
     async def compact_idle_session(
         self,
@@ -1388,6 +1406,7 @@ class Consolidator:
             self.sessions.save(session)
 
             if messages_to_remove:
+                self._drop_read_dedup(session_key)
                 logger.info(
                     "Idle-session compact for {}: archived={}, kept={}, recap={}",
                     session_key,
