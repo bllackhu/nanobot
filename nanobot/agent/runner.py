@@ -39,6 +39,7 @@ from nanobot.utils.runtime import (
     build_goal_continue_message,
     build_length_recovery_message,
     is_blank_text,
+    identical_call_signature,
     repeated_external_lookup_error,
     repeated_identical_call_error,
     repeated_workspace_violation_error,
@@ -47,6 +48,14 @@ from nanobot.utils.runtime import (
 GoalContinueMessage = str | Callable[[], str | None]
 
 _DEFAULT_ERROR_MESSAGE = "Sorry, I encountered an error calling the AI model."
+_REPEATED_IDENTICAL_BLOCK_FALLBACK = (
+    "This turn stopped because the same call was blocked and requested again. "
+    "Change the command, or for a source file use read_file with offset and limit once."
+)
+
+
+class RepeatedIdenticalBlockStop(Exception):
+    """The model requested a grep/exec signature that was already blocked."""
 _ARREARAGE_ERROR_MESSAGE = (
     "The AI provider rejected the request because the API key is out of quota or the "
     "account is in arrears. Please top up / check the billing status of your API key and try again."
@@ -335,6 +344,7 @@ class AgentRunner:
         external_lookup_counts: dict[str, int] = {}
         # Per-turn throttle for identical grep/exec calls.
         identical_call_counts: dict[str, int] = {}
+        blocked_identical_signatures: set[str] = set()
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
@@ -445,6 +455,7 @@ class AgentRunner:
                     hook,
                     context,
                     identical_call_counts=identical_call_counts,
+                    blocked_identical_signatures=blocked_identical_signatures,
                 )
                 tool_events.extend(new_events)
                 tools_used.extend(
@@ -469,6 +480,19 @@ class AgentRunner:
                     }
                     messages.append(tool_message)
                     completed_tool_results.append(tool_message)
+                if isinstance(fatal_error, RepeatedIdenticalBlockStop):
+                    final_content = await self._finalize_after_repeated_block(
+                        spec,
+                        hook,
+                        messages,
+                        usage,
+                    )
+                    stop_reason = "identical_call_blocked"
+                    self._append_final_message(messages, final_content)
+                    context.final_content = final_content
+                    context.stop_reason = stop_reason
+                    await hook.after_iteration(context)
+                    break
                 if fatal_error is not None:
                     error = f"Error: {type(fatal_error).__name__}: {fatal_error}"
                     final_content = error
@@ -943,6 +967,24 @@ class AgentRunner:
         retry_messages.append(build_finalization_retry_message())
         return retry_messages
 
+    async def _finalize_after_repeated_block(
+        self,
+        spec: AgentRunSpec,
+        hook: AgentHook,
+        messages: list[dict[str, Any]],
+        usage: dict[str, int],
+    ) -> str:
+        """One no-tools reply after a blocked grep/exec call is requested again."""
+        summarized = await self._try_finalize_after_max_iterations(
+            spec,
+            hook,
+            messages,
+            usage,
+        )
+        if summarized:
+            return summarized
+        return _REPEATED_IDENTICAL_BLOCK_FALLBACK
+
     async def _try_finalize_after_max_iterations(
         self,
         spec: AgentRunSpec,
@@ -1101,11 +1143,14 @@ class AgentRunner:
         context: AgentHookContext | None = None,
         *,
         identical_call_counts: dict[str, int] | None = None,
+        blocked_identical_signatures: set[str] | None = None,
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
         hook = hook or AgentHook()
         context = context or AgentHookContext(iteration=0, messages=[])
         if identical_call_counts is None:
             identical_call_counts = {}
+        if blocked_identical_signatures is None:
+            blocked_identical_signatures = set()
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
         for batch in batches:
@@ -1117,6 +1162,7 @@ class AgentRunner:
                         external_lookup_counts,
                         workspace_violation_counts,
                         identical_call_counts,
+                        blocked_identical_signatures,
                         hook,
                         context,
                     )
@@ -1132,6 +1178,7 @@ class AgentRunner:
                         external_lookup_counts,
                         workspace_violation_counts,
                         identical_call_counts,
+                        blocked_identical_signatures,
                         hook,
                         context,
                     )
@@ -1155,6 +1202,7 @@ class AgentRunner:
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
         identical_call_counts: dict[str, int],
+        blocked_identical_signatures: set[str],
         hook: AgentHook | None = None,
         context: AgentHookContext | None = None,
     ) -> tuple[Any, dict[str, str], BaseException | None]:
@@ -1172,6 +1220,11 @@ class AgentRunner:
                 "status": "error",
                 "detail": "identical tool call blocked",
             }
+            signature = identical_call_signature(tool_call.name, tool_call.arguments)
+            if signature and signature in blocked_identical_signatures:
+                return identical_error + hint, event, RepeatedIdenticalBlockStop()
+            if signature:
+                blocked_identical_signatures.add(signature)
             if spec.fail_on_tool_error:
                 return identical_error + hint, event, RuntimeError(identical_error)
             return identical_error + hint, event, None
