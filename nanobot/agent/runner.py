@@ -40,6 +40,7 @@ from nanobot.utils.runtime import (
     build_length_recovery_message,
     is_blank_text,
     repeated_external_lookup_error,
+    repeated_identical_call_error,
     repeated_workspace_violation_error,
 )
 
@@ -332,6 +333,8 @@ class AgentRunner:
         stop_reason = "completed"
         tool_events: list[dict[str, str]] = []
         external_lookup_counts: dict[str, int] = {}
+        # Per-turn throttle for identical grep/exec calls.
+        identical_call_counts: dict[str, int] = {}
         # Per-turn throttle for repeated attempts against the same outside target.
         workspace_violation_counts: dict[str, int] = {}
         empty_content_retries = 0
@@ -441,6 +444,7 @@ class AgentRunner:
                     workspace_violation_counts,
                     hook,
                     context,
+                    identical_call_counts=identical_call_counts,
                 )
                 tool_events.extend(new_events)
                 tools_used.extend(
@@ -1095,9 +1099,13 @@ class AgentRunner:
         workspace_violation_counts: dict[str, int],
         hook: AgentHook | None = None,
         context: AgentHookContext | None = None,
+        *,
+        identical_call_counts: dict[str, int] | None = None,
     ) -> tuple[list[Any], list[dict[str, str]], BaseException | None]:
         hook = hook or AgentHook()
         context = context or AgentHookContext(iteration=0, messages=[])
+        if identical_call_counts is None:
+            identical_call_counts = {}
         batches = self._partition_tool_batches(spec, tool_calls)
         tool_results: list[tuple[Any, dict[str, str], BaseException | None]] = []
         for batch in batches:
@@ -1108,6 +1116,7 @@ class AgentRunner:
                         tool_call,
                         external_lookup_counts,
                         workspace_violation_counts,
+                        identical_call_counts,
                         hook,
                         context,
                     )
@@ -1122,6 +1131,7 @@ class AgentRunner:
                         tool_call,
                         external_lookup_counts,
                         workspace_violation_counts,
+                        identical_call_counts,
                         hook,
                         context,
                     )
@@ -1144,12 +1154,27 @@ class AgentRunner:
         tool_call: ToolCallRequest,
         external_lookup_counts: dict[str, int],
         workspace_violation_counts: dict[str, int],
+        identical_call_counts: dict[str, int],
         hook: AgentHook | None = None,
         context: AgentHookContext | None = None,
     ) -> tuple[Any, dict[str, str], BaseException | None]:
         hook = hook or AgentHook()
         context = context or AgentHookContext(iteration=0, messages=[])
         hint = "\n\n[Analyze the error above and try a different approach.]"
+        identical_error = repeated_identical_call_error(
+            tool_call.name,
+            tool_call.arguments,
+            identical_call_counts,
+        )
+        if identical_error:
+            event = {
+                "name": tool_call.name,
+                "status": "error",
+                "detail": "identical tool call blocked",
+            }
+            if spec.fail_on_tool_error:
+                return identical_error + hint, event, RuntimeError(identical_error)
+            return identical_error + hint, event, None
         lookup_error = repeated_external_lookup_error(
             tool_call.name,
             tool_call.arguments,
