@@ -16,6 +16,7 @@ DEFAULT_NEW_SESSION_PHRASES: tuple[str, ...] = (
     "新对话",
     "新会话",
     "新任务",
+    "新话题",
     "new",
     "new chat",
     "new session",

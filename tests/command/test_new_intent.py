@@ -17,6 +17,7 @@ def test_default_list_contains_agreed_phrases() -> None:
         "新对话",
         "新会话",
         "新任务",
+        "新话题",
         "new",
         "new chat",
         "new session",
