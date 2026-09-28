@@ -345,7 +345,8 @@ async def test_consolidation_drops_read_dedup_and_keeps_read_record(tmp_path, mo
     finally:
         reset_file_states(token)
     assert "palette A" in first
-    assert "force=true" in stub
+    assert "unchanged" in stub.lower()
+    assert "force=true" not in stub
     assert states.check_read(note) is None
 
     session = loop.sessions.get_or_create("cli:test")

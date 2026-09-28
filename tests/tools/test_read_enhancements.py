@@ -55,9 +55,21 @@ class TestReadDedup:
         assert "line 0" in first
         second = await tool.execute(path=str(f))
         assert "unchanged" in second.lower()
-        assert "force=true" in second
+        assert "force=true" not in second
+        assert "do not read this path again" in second.lower()
         # Stub should not contain file content
         assert "line 0" not in second
+
+    @pytest.mark.asyncio
+    async def test_force_true_on_unchanged_file_returns_stub(self, tool, tmp_path):
+        f = tmp_path / "data.txt"
+        f.write_text("\n".join(f"line {i}" for i in range(100)), encoding="utf-8")
+        first = await tool.execute(path=str(f))
+        assert "line 0" in first
+        forced = await tool.execute(path=str(f), force=True)
+        assert "unchanged" in forced.lower()
+        assert "line 0" not in forced
+        assert "force=true" not in forced
 
     @pytest.mark.asyncio
     async def test_read_after_external_modification_returns_full(self, tool, tmp_path):
