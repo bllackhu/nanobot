@@ -1462,35 +1462,44 @@ def test_deepseek_chat_keeps_tool_history_when_effort_implicit() -> None:
     assert "reasoning_content" not in kw["messages"][1]
 
 
-def test_deepseek_coerces_list_content_to_string() -> None:
-    """DeepSeek chat endpoint expects message.content to be a string."""
+def test_deepseek_keeps_multimodal_content() -> None:
+    """DeepSeek sends OpenAI content lists, including image_url blocks."""
     spec = find_by_name("deepseek")
     with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
-        p = OpenAICompatProvider(api_key="k", default_model="deepseek-chat", spec=spec)
+        p = OpenAICompatProvider(api_key="k", default_model="deepseek-v4.1-flash", spec=spec)
 
-    kw = p._build_kwargs(
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "hello "},
-                {"type": "text", "text": "world"},
-            ],
-        }],
-        tools=None,
-        model="deepseek-chat",
-        max_tokens=1024,
-        temperature=0.7,
-        reasoning_effort=None,
-        tool_choice=None,
-    )
+    image_url = "data:image/jpeg;base64,abc"
 
-    assert isinstance(kw["messages"][0]["content"], str)
-    assert "hello" in kw["messages"][0]["content"]
-    assert "world" in kw["messages"][0]["content"]
+    def build(content: list[dict]) -> dict:
+        return p._build_kwargs(
+            messages=[{"role": "user", "content": content}],
+            tools=None,
+            model="deepseek-v4.1-flash",
+            max_tokens=1024,
+            temperature=0.7,
+            reasoning_effort=None,
+            tool_choice=None,
+        )
+
+    image_content = build([
+        {"type": "image_url", "image_url": {"url": image_url}},
+        {"type": "text", "text": "[image: /tmp/photo.jpg]"},
+    ])["messages"][0]["content"]
+    assert isinstance(image_content, list)
+    assert image_content[0]["type"] == "image_url"
+    assert image_content[0]["image_url"]["url"] == image_url
+    assert image_content[1]["text"] == "[image: /tmp/photo.jpg]"
+
+    text_content = build([
+        {"type": "text", "text": "hello "},
+        {"type": "text", "text": "world"},
+    ])["messages"][0]["content"]
+    assert isinstance(text_content, list)
+    assert [part["text"] for part in text_content] == ["hello ", "world"]
 
 
 def test_non_deepseek_keeps_list_content() -> None:
-    """Only DeepSeek should force string content; OpenAI-compatible providers keep blocks."""
+    """OpenAI-compatible providers keep content blocks."""
     spec = find_by_name("openai")
     with patch("nanobot.providers.openai_compat_provider.AsyncOpenAI"):
         p = OpenAICompatProvider(api_key="k", default_model="gpt-4o", spec=spec)
