@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+from collections import deque
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -316,8 +317,8 @@ async def test_send_text_with_frame() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_progress_with_frame() -> None:
-    """Progress events use reply_stream with finish=False."""
+async def test_send_progress_without_tool_hint_is_a_noop() -> None:
+    """Partial answer text and reasoning must not open another stream."""
     channel = WecomChannel(WecomConfig(bot_id="b", secret="s", allow_from=["*"]), MessageBus())
     client = _FakeWeComClient()
     channel._client = client
@@ -332,11 +333,16 @@ async def test_send_progress_with_frame() -> None:
             event=ProgressEvent(content="thinking..."),
         )
     )
+    await channel.send(
+        OutboundMessage(
+            channel="wecom",
+            chat_id="chat1",
+            content="reasoning",
+            event=ProgressEvent(content="reasoning", reasoning_delta=True),
+        )
+    )
 
-    client.reply_stream.assert_called_once()
-    call_args = client.reply_stream.call_args
-    assert call_args[0][2] == "thinking..."  # content arg
-    assert call_args[1]["finish"] is False
+    client.reply_stream.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -428,6 +434,275 @@ async def test_send_exception_propagates_for_manager_retry() -> None:
             OutboundMessage(channel="wecom", chat_id="chat1", content="fail test")
         )
     client.reply_stream.assert_called_once()
+
+
+def _text_frame(msgid: str, chat_id: str = "chat1", content: str = "在不") -> _FakeFrame:
+    return _FakeFrame(body={
+        "msgid": msgid,
+        "chatid": chat_id,
+        "chattype": "single",
+        "from": {"userid": "user1"},
+        "text": {"content": content},
+    })
+
+
+def _channel(**overrides: object) -> WecomChannel:
+    config = {
+        "bot_id": "b",
+        "secret": "s",
+        "allow_from": ["user1"],
+    }
+    config.update(overrides)
+    channel = WecomChannel(config, MessageBus())
+    channel._client = _FakeWeComClient()
+    channel._generate_req_id = lambda kind: f"req_{kind}"
+    return channel
+
+
+@pytest.mark.asyncio
+async def test_accepted_text_opens_thinking_bubble() -> None:
+    """An accepted message opens one unfinished stream with a single space."""
+    channel = _channel()
+    await channel._process_message(_text_frame("msg-1"), "text")
+
+    channel._client.reply_stream.assert_awaited_once()
+    args, kwargs = channel._client.reply_stream.call_args
+    assert args[2] == " "
+    assert kwargs["finish"] is False
+    assert "msg-1" in channel._open_streams
+    inbound = await channel.bus.consume_inbound()
+    assert inbound.content == "在不"
+
+
+@pytest.mark.asyncio
+async def test_final_send_reuses_thinking_stream() -> None:
+    """The answer finishes the same stream and does not send a second message."""
+    channel = _channel()
+    await channel._process_message(_text_frame("msg-1"), "text")
+    stream_id = channel._open_streams["msg-1"].stream_id
+
+    await channel.send(OutboundMessage(
+        channel="wecom",
+        chat_id="chat1",
+        content="hello",
+        metadata={"message_id": "msg-1"},
+    ))
+
+    assert channel._client.reply_stream.await_count == 2
+    finish_args, finish_kwargs = channel._client.reply_stream.await_args_list[1]
+    assert finish_args[1] == stream_id
+    assert finish_args[2] == "hello"
+    assert finish_kwargs["finish"] is True
+    channel._client.send_message.assert_not_called()
+    assert "msg-1" not in channel._open_streams
+
+
+@pytest.mark.asyncio
+async def test_empty_final_closes_bubble_without_blank_content() -> None:
+    """A turn with no text still finishes the open bubble using the placeholder."""
+    channel = _channel()
+    await channel._process_message(_text_frame("msg-1"), "text")
+
+    await channel.send(OutboundMessage(
+        channel="wecom",
+        chat_id="chat1",
+        content="  ",
+        metadata={"message_id": "msg-1"},
+    ))
+
+    finish_args, finish_kwargs = channel._client.reply_stream.await_args
+    assert finish_args[2] == " "
+    assert finish_kwargs["finish"] is True
+    assert "msg-1" not in channel._open_streams
+
+
+@pytest.mark.asyncio
+async def test_tool_hint_rewrites_same_stream_with_3s_clamp() -> None:
+    """One tool line every 3 seconds. Bursts, repeats, and reasoning do not send."""
+    channel = _channel()
+    clock = {"t": 100.0}
+    channel._now = lambda: clock["t"]
+    await channel._process_message(_text_frame("msg-1"), "text")
+    stream_id = channel._open_streams["msg-1"].stream_id
+
+    async def hint(text: str, **event_kwargs: object) -> None:
+        await channel.send(OutboundMessage(
+            channel="wecom",
+            chat_id="chat1",
+            content=text,
+            metadata={"message_id": "msg-1"},
+            event=ProgressEvent(content=text, **event_kwargs),
+        ))
+
+    await hint("search \"会议\"", tool_hint=True)
+    search_args, search_kwargs = channel._client.reply_stream.await_args
+    assert search_args[1] == stream_id
+    assert search_args[2] == "search \"会议\""
+    assert search_kwargs["finish"] is False
+
+    clock["t"] = 101.0
+    await hint("read notes", tool_hint=True)
+    assert channel._client.reply_stream.await_count == 2
+
+    clock["t"] = 104.0
+    await hint("search \"会议\"", tool_hint=True)
+    assert channel._client.reply_stream.await_count == 2
+
+    clock["t"] = 108.0
+    await hint("read notes", tool_hint=True)
+    assert channel._client.reply_stream.await_count == 3
+
+    await hint("private", reasoning_delta=True, tool_hint=True)
+    await hint("partial answer")
+    assert channel._client.reply_stream.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_stream_budget_skips_placeholder_but_sends_final() -> None:
+    """Twenty stream frames in the last minute skip the dots. The answer still goes out."""
+    channel = _channel()
+    now = channel._now()
+    channel._stream_sends["chat1"] = deque([now] * 20)
+
+    await channel._process_message(_text_frame("msg-1"), "text")
+    channel._client.reply_stream.assert_not_called()
+
+    await channel.send(OutboundMessage(
+        channel="wecom",
+        chat_id="chat1",
+        content="answer",
+        metadata={"message_id": "msg-1"},
+    ))
+    channel._client.reply_stream.assert_awaited_once()
+    assert channel._client.reply_stream.await_args.kwargs["finish"] is True
+
+
+@pytest.mark.asyncio
+async def test_fourth_open_placeholder_is_skipped() -> None:
+    """A chat keeps at most three loading bubbles. The next answer is still one frame."""
+    channel = _channel()
+    for index in range(3):
+        await channel._process_message(_text_frame(f"msg-{index}"), "text")
+    assert channel._client.reply_stream.await_count == 3
+
+    await channel._process_message(_text_frame("msg-3"), "text")
+    assert channel._client.reply_stream.await_count == 3
+    assert "msg-3" not in channel._open_streams
+
+    await channel.send(OutboundMessage(
+        channel="wecom",
+        chat_id="chat1",
+        content="later",
+        metadata={"message_id": "msg-3"},
+    ))
+    assert channel._client.reply_stream.await_count == 4
+    assert channel._client.reply_stream.await_args.kwargs["finish"] is True
+
+
+@pytest.mark.asyncio
+async def test_placeholder_failure_is_not_retried() -> None:
+    """A failed placeholder is one attempt and does not open a stream."""
+    channel = _channel()
+    channel._client.reply_stream.side_effect = RuntimeError("boom")
+
+    await channel._process_message(_text_frame("msg-1"), "text")
+
+    channel._client.reply_stream.assert_awaited_once()
+    assert channel._open_streams == {}
+    inbound = await channel.bus.consume_inbound()
+    assert inbound.content == "在不"
+
+
+@pytest.mark.asyncio
+async def test_frequency_limit_stops_new_placeholders() -> None:
+    """A frequency-limit ack blocks further dots and does not open a stream."""
+    channel = _channel()
+    channel._client.reply_stream.return_value = _FakeResponse(
+        errcode=45009,
+        errmsg="api freq out of limit",
+    )
+
+    await channel._process_message(_text_frame("msg-1"), "text")
+    await channel._process_message(_text_frame("msg-2"), "text")
+
+    channel._client.reply_stream.assert_awaited_once()
+    assert channel._open_streams == {}
+
+
+@pytest.mark.asyncio
+async def test_finish_ack_timeout_is_not_resent() -> None:
+    """A finish frame that times out after it was written is not sent again."""
+    channel = _channel()
+    await channel._process_message(_text_frame("msg-1"), "text")
+    channel._client.reply_stream.side_effect = TimeoutError("reply ack timeout")
+
+    outbound = OutboundMessage(
+        channel="wecom",
+        chat_id="chat1",
+        content="hello",
+        metadata={"message_id": "msg-1"},
+    )
+    await channel.send(outbound)
+    await channel.send(outbound)
+
+    assert channel._client.reply_stream.await_count == 2
+    assert "msg-1" in channel._finished_msgids
+
+
+@pytest.mark.asyncio
+async def test_thinking_bubble_off_keeps_oneshot_final() -> None:
+    """Opt-out skips the dots. Progress still cannot leak an unfinished stream."""
+    channel = _channel(thinking_bubble=False)
+    await channel._process_message(_text_frame("msg-1"), "text")
+    channel._client.reply_stream.assert_not_called()
+
+    await channel.send(OutboundMessage(
+        channel="wecom",
+        chat_id="chat1",
+        content="search",
+        metadata={"message_id": "msg-1"},
+        event=ProgressEvent(content="search", tool_hint=True),
+    ))
+    channel._client.reply_stream.assert_not_called()
+
+    await channel.send(OutboundMessage(
+        channel="wecom",
+        chat_id="chat1",
+        content="hello",
+        metadata={"message_id": "msg-1"},
+    ))
+    channel._client.reply_stream.assert_awaited_once()
+    assert channel._client.reply_stream.await_args.kwargs["finish"] is True
+
+
+@pytest.mark.asyncio
+async def test_expired_stream_finishes_once() -> None:
+    """A bubble still open at the age limit is closed once and not replaced."""
+    channel = _channel()
+    await channel._process_message(_text_frame("msg-1"), "text")
+    channel._open_streams["msg-1"].last_tool_text = "search"
+
+    await channel._close_expired_stream("msg-1")
+    await channel._close_expired_stream("msg-1")
+
+    assert channel._client.reply_stream.await_count == 2
+    finish_args, finish_kwargs = channel._client.reply_stream.await_args
+    assert finish_args[2] == "search"
+    assert finish_kwargs["finish"] is True
+    assert "msg-1" not in channel._open_streams
+
+
+def test_omitted_send_tool_hints_defaults_on_for_wecom() -> None:
+    """WeCom receives tool hints unless this channel's config turns them off."""
+    channel = _channel()
+    channel.send_tool_hints = False
+    channel._apply_tool_hint_delivery()
+    assert channel.send_tool_hints is True
+
+    opted_out = _channel(sendToolHints=False)
+    opted_out.send_tool_hints = True
+    opted_out._apply_tool_hint_delivery()
+    assert opted_out.send_tool_hints is False
 
 
 # ── _process_message() ──────────────────────────────────────────────

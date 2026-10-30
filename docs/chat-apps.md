@@ -899,6 +899,8 @@ Go to the WeCom admin console → Intelligent Robot → Create Robot → select 
 nanobot gateway
 ```
 
+On each user message the bot sends one unfinished stream reply. WeCom draws that as the three-dot loading bubble, and in a group it also quotes the message above the dots. A tool step can replace the bubble text, at most once every 3 seconds. The final answer replaces that same bubble. Set `thinkingBubble` to false to skip the dots. `sendToolHints` defaults to true on this channel so those tool lines are delivered; set it to false to leave the dots in place until the answer.
+
 </details>
 
 <details>
